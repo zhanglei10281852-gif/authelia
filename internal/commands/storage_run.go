@@ -1236,15 +1236,39 @@ func runStorageUserWebAuthnImport(ctx context.Context, w io.Writer, store storag
 		return fmt.Errorf("can't import a %s file without WebAuthn credentials data", format)
 	}
 
+	// The entire file is imported as a single transaction so that a failure encrypting or persisting any
+	// credential (or committing the transaction) does not leave a partial set of records in the database.
+	var tx context.Context
+
+	if tx, err = store.BeginTX(ctx); err != nil {
+		return fmt.Errorf("error beginning transaction to import WebAuthn credentials from file '%s': %w", filename, err)
+	}
+
 	for _, credential := range export.WebAuthnCredentials {
-		if err = store.SaveWebAuthnCredential(ctx, credential); err != nil {
-			return err
+		if err = store.SaveWebAuthnCredential(tx, credential); err != nil {
+			return rollbackStorageUserWebAuthnImport(tx, store, err)
 		}
+	}
+
+	if err = store.Commit(tx); err != nil {
+		return rollbackStorageUserWebAuthnImport(tx, store, fmt.Errorf("error occurred committing the WebAuthn credentials import from file '%s': %w", filename, err))
 	}
 
 	_, _ = fmt.Fprintf(w, cliOutputFmtSuccessfulUserImportFile, len(export.WebAuthnCredentials), "WebAuthn credentials", format, filename)
 
 	return nil
+}
+
+// rollbackStorageUserWebAuthnImport rolls back a failed WebAuthn credentials import transaction. When the rollback
+// itself fails both the original failure and the rollback failure are returned so the operation can never be
+// reported as successful. A [sql.ErrTxDone] indicates the transaction has already been terminated and is not
+// considered an additional rollback failure.
+func rollbackStorageUserWebAuthnImport(ctx context.Context, store storage.Provider, cause error) error {
+	if rerr := store.Rollback(ctx); rerr != nil && !errors.Is(rerr, sql.ErrTxDone) {
+		return errors.Join(cause, fmt.Errorf("error occurred rolling back the WebAuthn credentials import: %w", rerr))
+	}
+
+	return cause
 }
 
 // StorageUserWebAuthnListRunE is the RunE for the authelia storage user webauthn list command.

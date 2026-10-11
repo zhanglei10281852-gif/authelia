@@ -7,6 +7,8 @@ package commands
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,8 +21,10 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
+	"github.com/authelia/authelia/v4/internal/mocks"
 	"github.com/authelia/authelia/v4/internal/model"
 	"github.com/authelia/authelia/v4/internal/storage"
 )
@@ -713,6 +717,242 @@ func TestRunStorageUserWebAuthnImport(t *testing.T) {
 
 		assert.NoError(t, err)
 		assert.Contains(t, buf.String(), "Successfully imported 1 WebAuthn credentials")
+	})
+
+	t.Run("ShouldSucceedImportFormats", func(t *testing.T) {
+		for _, tc := range []struct {
+			ext    string
+			format string
+		}{
+			{ext: ".yml", format: "YAML"},
+			{ext: ".yaml", format: "YAML"},
+			{ext: ".toml", format: "TOML"},
+			{ext: ".json", format: "JSON"},
+		} {
+			t.Run(tc.ext, func(t *testing.T) {
+				store := newTestSQLiteStore(t)
+
+				filename := filepath.Join(t.TempDir(), "import"+tc.ext)
+
+				writeWebAuthnCredentialImportFile(t, filename,
+					newTestWebAuthnCredential("john", "key-1", []byte("kid-1")),
+					newTestWebAuthnCredential("harry", "key-2", []byte("kid-2")),
+				)
+
+				buf := new(bytes.Buffer)
+
+				require.NoError(t, runStorageUserWebAuthnImport(context.Background(), buf, store, filename))
+				assert.Contains(t, buf.String(), "Successfully imported 2 WebAuthn credentials from the "+tc.format+" file")
+
+				john, err := store.LoadWebAuthnCredentialsByUsername(context.Background(), "", "john")
+				require.NoError(t, err)
+				assert.Len(t, john, 1)
+
+				harry, err := store.LoadWebAuthnCredentialsByUsername(context.Background(), "", "harry")
+				require.NoError(t, err)
+				assert.Len(t, harry, 1)
+			})
+		}
+	})
+
+	t.Run("ShouldRollbackWhenLaterCredentialDuplicatesExistingRecord", func(t *testing.T) {
+		store := newTestSQLiteStore(t)
+
+		// Pre-existing record duplicated by the second credential in the import file.
+		seedWebAuthnCredential(t, context.Background(), store, "harry", "key-2", []byte("kid-2"))
+
+		filename := filepath.Join(t.TempDir(), "import.yml")
+
+		writeWebAuthnCredentialImportFile(t, filename,
+			newTestWebAuthnCredential("john", "key-1", []byte("kid-1")),
+			newTestWebAuthnCredential("harry", "key-2", []byte("kid-2")),
+		)
+
+		assertImportRollsBack := func() {
+			t.Helper()
+
+			buf := new(bytes.Buffer)
+
+			err := runStorageUserWebAuthnImport(context.Background(), buf, store, filename)
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "error inserting WebAuthn credential")
+			assert.NotContains(t, buf.String(), "Successfully imported")
+
+			john, lerr := store.LoadWebAuthnCredentialsByUsername(context.Background(), "", "john")
+			require.NoError(t, lerr)
+			assert.Empty(t, john)
+
+			harry, lerr := store.LoadWebAuthnCredentialsByUsername(context.Background(), "", "harry")
+			require.NoError(t, lerr)
+			assert.Len(t, harry, 1)
+		}
+
+		// First attempt fails on the duplicate and must roll back the record inserted earlier in the file.
+		assertImportRollsBack()
+
+		// Re-running the same file must behave identically instead of colliding with residual records.
+		assertImportRollsBack()
+	})
+
+	t.Run("ShouldRollbackWhenFileContainsDuplicateCredentials", func(t *testing.T) {
+		store := newTestSQLiteStore(t)
+
+		filename := filepath.Join(t.TempDir(), "import.yml")
+
+		writeWebAuthnCredentialImportFile(t, filename,
+			newTestWebAuthnCredential("john", "key-1", []byte("kid-dup")),
+			newTestWebAuthnCredential("harry", "key-2", []byte("kid-dup")),
+		)
+
+		runImport := func() error {
+			return runStorageUserWebAuthnImport(context.Background(), new(bytes.Buffer), store, filename)
+		}
+
+		err := runImport()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "error inserting WebAuthn credential")
+
+		credentials, lerr := store.LoadWebAuthnCredentials(context.Background(), 10, 0)
+		require.NoError(t, lerr)
+		assert.Empty(t, credentials)
+
+		// An immediate re-run of the same file must not be blocked by records left from the failed attempt.
+		err = runImport()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "error inserting WebAuthn credential")
+
+		credentials, lerr = store.LoadWebAuthnCredentials(context.Background(), 10, 0)
+		require.NoError(t, lerr)
+		assert.Empty(t, credentials)
+	})
+}
+
+func TestRunStorageUserWebAuthnImportTransaction(t *testing.T) {
+	type testTxContextKey struct{}
+
+	writeImportFile := func(t *testing.T) string {
+		t.Helper()
+
+		filename := filepath.Join(t.TempDir(), "import.yml")
+
+		writeWebAuthnCredentialImportFile(t, filename,
+			newTestWebAuthnCredential("john", "key-1", []byte("kid-1")),
+			newTestWebAuthnCredential("harry", "key-2", []byte("kid-2")),
+		)
+
+		return filename
+	}
+
+	t.Run("ShouldErrBeginTX", func(t *testing.T) {
+		mock := mocks.NewMockStorage(gomock.NewController(t))
+
+		mock.EXPECT().BeginTX(gomock.Any()).Return(nil, errors.New("begin failed"))
+
+		err := runStorageUserWebAuthnImport(context.Background(), new(bytes.Buffer), mock, writeImportFile(t))
+
+		assert.ErrorContains(t, err, "error beginning transaction")
+		assert.ErrorContains(t, err, "begin failed")
+	})
+
+	t.Run("ShouldRollbackWhenCredentialSaveFails", func(t *testing.T) {
+		mock := mocks.NewMockStorage(gomock.NewController(t))
+
+		txCtx := context.WithValue(context.Background(), testTxContextKey{}, true)
+
+		saveErr := errors.New("encryption failed")
+
+		gomock.InOrder(
+			mock.EXPECT().BeginTX(gomock.Any()).Return(txCtx, nil),
+			mock.EXPECT().SaveWebAuthnCredential(gomock.Eq(txCtx), gomock.Any()).Return(saveErr),
+			mock.EXPECT().Rollback(gomock.Eq(txCtx)).Return(nil),
+		)
+
+		err := runStorageUserWebAuthnImport(context.Background(), new(bytes.Buffer), mock, writeImportFile(t))
+
+		assert.ErrorIs(t, err, saveErr)
+		assert.NotContains(t, err.Error(), "rolling back")
+	})
+
+	t.Run("ShouldPreserveSaveAndRollbackErrors", func(t *testing.T) {
+		mock := mocks.NewMockStorage(gomock.NewController(t))
+
+		txCtx := context.WithValue(context.Background(), testTxContextKey{}, true)
+
+		saveErr := errors.New("encryption failed")
+		rollbackErr := errors.New("rollback failed")
+
+		gomock.InOrder(
+			mock.EXPECT().BeginTX(gomock.Any()).Return(txCtx, nil),
+			mock.EXPECT().SaveWebAuthnCredential(gomock.Eq(txCtx), gomock.Any()).Return(saveErr),
+			mock.EXPECT().Rollback(gomock.Eq(txCtx)).Return(rollbackErr),
+		)
+
+		err := runStorageUserWebAuthnImport(context.Background(), new(bytes.Buffer), mock, writeImportFile(t))
+
+		assert.ErrorIs(t, err, saveErr)
+		assert.ErrorIs(t, err, rollbackErr)
+		assert.ErrorContains(t, err, "error occurred rolling back the WebAuthn credentials import")
+	})
+
+	t.Run("ShouldRollbackWhenCommitFails", func(t *testing.T) {
+		mock := mocks.NewMockStorage(gomock.NewController(t))
+
+		txCtx := context.WithValue(context.Background(), testTxContextKey{}, true)
+
+		commitErr := errors.New("commit failed")
+
+		gomock.InOrder(
+			mock.EXPECT().BeginTX(gomock.Any()).Return(txCtx, nil),
+			mock.EXPECT().SaveWebAuthnCredential(gomock.Eq(txCtx), gomock.Any()).Return(nil).Times(2),
+			mock.EXPECT().Commit(gomock.Eq(txCtx)).Return(commitErr),
+			mock.EXPECT().Rollback(gomock.Eq(txCtx)).Return(sql.ErrTxDone),
+		)
+
+		err := runStorageUserWebAuthnImport(context.Background(), new(bytes.Buffer), mock, writeImportFile(t))
+
+		assert.ErrorIs(t, err, commitErr)
+		assert.ErrorContains(t, err, "error occurred committing the WebAuthn credentials import")
+		assert.NotContains(t, err.Error(), "rolling back")
+	})
+
+	t.Run("ShouldPreserveCommitAndRollbackErrors", func(t *testing.T) {
+		mock := mocks.NewMockStorage(gomock.NewController(t))
+
+		txCtx := context.WithValue(context.Background(), testTxContextKey{}, true)
+
+		commitErr := errors.New("commit failed")
+		rollbackErr := errors.New("rollback failed")
+
+		gomock.InOrder(
+			mock.EXPECT().BeginTX(gomock.Any()).Return(txCtx, nil),
+			mock.EXPECT().SaveWebAuthnCredential(gomock.Eq(txCtx), gomock.Any()).Return(nil).Times(2),
+			mock.EXPECT().Commit(gomock.Eq(txCtx)).Return(commitErr),
+			mock.EXPECT().Rollback(gomock.Eq(txCtx)).Return(rollbackErr),
+		)
+
+		err := runStorageUserWebAuthnImport(context.Background(), new(bytes.Buffer), mock, writeImportFile(t))
+
+		assert.ErrorIs(t, err, commitErr)
+		assert.ErrorIs(t, err, rollbackErr)
+		assert.ErrorContains(t, err, "error occurred rolling back the WebAuthn credentials import")
+	})
+
+	t.Run("ShouldCommitAllCredentials", func(t *testing.T) {
+		mock := mocks.NewMockStorage(gomock.NewController(t))
+
+		txCtx := context.WithValue(context.Background(), testTxContextKey{}, true)
+
+		gomock.InOrder(
+			mock.EXPECT().BeginTX(gomock.Any()).Return(txCtx, nil),
+			mock.EXPECT().SaveWebAuthnCredential(gomock.Eq(txCtx), gomock.Any()).Return(nil).Times(2),
+			mock.EXPECT().Commit(gomock.Eq(txCtx)).Return(nil),
+		)
+
+		buf := new(bytes.Buffer)
+
+		require.NoError(t, runStorageUserWebAuthnImport(context.Background(), buf, mock, writeImportFile(t)))
+		assert.Contains(t, buf.String(), "Successfully imported 2 WebAuthn credentials")
 	})
 }
 
@@ -3440,10 +3680,8 @@ func seedTOTPConfig(t *testing.T, ctx context.Context, store storage.Provider, u
 	}))
 }
 
-func seedWebAuthnCredential(t *testing.T, ctx context.Context, store storage.Provider, username, description string, kid []byte) {
-	t.Helper()
-
-	require.NoError(t, store.SaveWebAuthnCredential(ctx, model.WebAuthnCredential{
+func newTestWebAuthnCredential(username, description string, kid []byte) model.WebAuthnCredential {
+	return model.WebAuthnCredential{
 		CreatedAt:       time.Now(),
 		RPID:            "example.com",
 		Username:        username,
@@ -3453,7 +3691,27 @@ func seedWebAuthnCredential(t *testing.T, ctx context.Context, store storage.Pro
 		Attachment:      "cross-platform",
 		Transport:       "",
 		PublicKey:       []byte("fake-public-key"),
-	}))
+	}
+}
+
+func seedWebAuthnCredential(t *testing.T, ctx context.Context, store storage.Provider, username, description string, kid []byte) {
+	t.Helper()
+
+	require.NoError(t, store.SaveWebAuthnCredential(ctx, newTestWebAuthnCredential(username, description, kid)))
+}
+
+func writeWebAuthnCredentialImportFile(t *testing.T, filename string, credentials ...model.WebAuthnCredential) {
+	t.Helper()
+
+	data := model.WebAuthnCredentialDataExport{
+		WebAuthnCredentials: make([]model.WebAuthnCredentialData, len(credentials)),
+	}
+
+	for i, credential := range credentials {
+		data.WebAuthnCredentials[i] = credential.ToData()
+	}
+
+	require.NoError(t, exportFile(filename, data, ""))
 }
 
 func seedUserOpaqueIdentifier(t *testing.T, ctx context.Context, store storage.Provider, username, service, sector string) {

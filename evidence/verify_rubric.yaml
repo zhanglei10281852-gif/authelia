@@ -1,0 +1,20 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 合法的单条或多条 WebAuthn 文件仅在全部凭据持久化完成后提交并输出准确成功计数。
+  - id: 2
+    type: f2p
+    text: 中间任一凭据加密或写入失败时，本次导入新增的所有前缀记录都被回滚。
+  - id: 3
+    type: f2p
+    text: 文件内重复项或与库中现有凭据冲突时目标库保持执行前集合，同一文件可在纠正后安全重试。
+  - id: 4
+    type: f2p
+    text: 提交失败会触发回滚且不打印成功，回滚也失败时错误同时包含原始阶段和恢复阶段。
+  - id: 5
+    type: p2p
+    text: YAML、TOML、JSON 的现有 schema、空数据和格式错误处理以及 export-import round trip 保持兼容。
+  - id: 6
+    type: p2p
+    text: 门户中的 WebAuthn 注册、认证元数据更新和既有凭据读取不受批量导入事务影响。
+
