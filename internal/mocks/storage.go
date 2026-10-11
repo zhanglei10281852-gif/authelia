@@ -134,6 +134,21 @@ func (mr *MockStorageMockRecorder) ConsumeOneTimeCode(ctx, code any) *gomock.Cal
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ConsumeOneTimeCode", reflect.TypeOf((*MockStorage)(nil).ConsumeOneTimeCode), ctx, code)
 }
 
+// ConsumeTOTPHistory mocks base method.
+func (m *MockStorage) ConsumeTOTPHistory(ctx context.Context, username string, step uint64) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ConsumeTOTPHistory", ctx, username, step)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ConsumeTOTPHistory indicates an expected call of ConsumeTOTPHistory.
+func (mr *MockStorageMockRecorder) ConsumeTOTPHistory(ctx, username, step any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ConsumeTOTPHistory", reflect.TypeOf((*MockStorage)(nil).ConsumeTOTPHistory), ctx, username, step)
+}
+
 // DeactivateOAuth2DeviceCodeSession mocks base method.
 func (m *MockStorage) DeactivateOAuth2DeviceCodeSession(ctx context.Context, signature string) error {
 	m.ctrl.T.Helper()
@@ -814,6 +829,20 @@ func (m *MockStorage) LoadWebAuthnUserByUserID(ctx context.Context, rpid, userID
 func (mr *MockStorageMockRecorder) LoadWebAuthnUserByUserID(ctx, rpid, userID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LoadWebAuthnUserByUserID", reflect.TypeOf((*MockStorage)(nil).LoadWebAuthnUserByUserID), ctx, rpid, userID)
+}
+
+// ReleaseTOTPHistory mocks base method.
+func (m *MockStorage) ReleaseTOTPHistory(ctx context.Context, username string, step uint64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ReleaseTOTPHistory", ctx, username, step)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ReleaseTOTPHistory indicates an expected call of ReleaseTOTPHistory.
+func (mr *MockStorageMockRecorder) ReleaseTOTPHistory(ctx, username, step any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReleaseTOTPHistory", reflect.TypeOf((*MockStorage)(nil).ReleaseTOTPHistory), ctx, username, step)
 }
 
 // RevokeBannedIP mocks base method.

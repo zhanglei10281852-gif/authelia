@@ -1,0 +1,1022 @@
+diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
+new file mode 100644
+index 000000000..d8edad3c2
+--- /dev/null
++++ b/evidence/rubric-comparison.txt
+@@ -0,0 +1,9 @@
++项目：authelia-authelia-8e62a6ed-0cfd-414d-b51b-e52cbe71c74c｜TOTP 重放占用与认证完成闭环
++验证摘要：go test -count=1 ./internal/handlers -run '^TestTimeBasedOneTimePasswordPOST$' 通过；go test -count=1 ./internal/storage -run '^TestSQLProviderTOTPHistory$' 无匹配用例，生产代码和新增测试完成独立审计。
++Rubric ID：1｜状态：通过｜期望行为：重用保护开启时，同一用户同一时间步的并发提交只有一个请求获得可用二因素会话。｜实际观察：ConsumeTOTPHistory 以 username 和 HMAC 后的 step 唯一键执行原子插入，只有 consumed=true 的请求继续重建并保存二因素会话，竞争失败请求在保护开启时返回 403。｜直接证据：internal/handlers/handler_sign_totp.go:148-176；internal/storage/sql_provider.go:675-690；handler 定向测试通过。
++Rubric ID：2｜状态：通过｜期望行为：竞争失败的请求被稳定判定为验证码重放，不会泄露唯一约束或泛化存储错误。｜实际观察：唯一约束错误被 ConsumeTOTPHistory 转换为 consumed=false、err=nil，处理器按重放策略返回固定 MFA 校验失败响应。｜直接证据：internal/storage/sql_provider.go:679-687；internal/handlers/handler_sign_totp.go:164-176；TestShouldStablyIdentifyReplayedCode 通过。
++Rubric ID：3｜状态：未通过｜期望行为：会话重建或保存失败后，不会留下永久消耗验证码但没有可用二因素会话的状态，并具有确定的重试恢复结果。｜实际观察：会话重建或保存失败会调用 ReleaseTOTPHistory；该删除失败时处理器只记录日志，仍返回 403，已占用的 history 行保持不变。｜直接证据：internal/handlers/handler_sign_totp.go:180-213；internal/storage/sql_provider.go:693-701。｜原因：补偿删除失败未改变响应也未进入可重试恢复流程，验证码占用记录继续存在｜影响：用户没有获得二因素会话且同一有效验证码的后续请求被稳定判定为重放｜证据位置：internal/handlers/handler_sign_totp.go:180-188、190-213
++Rubric ID：4｜状态：未通过｜期望行为：TOTP last_used_at、认证成功或失败日志、重放状态和会话终态不会互相矛盾。｜实际观察：会话已保存后 UpdateTOTPConfigurationSignIn 失败只记录日志，处理器随后写入认证成功记录并返回成功响应。｜直接证据：internal/handlers/handler_sign_totp.go:215-231。｜原因：last_used_at 持久化失败未阻止成功认证日志和成功响应，凭据状态与会话及审计结果不同步｜影响：存储中的凭据使用时间保持旧值，而认证日志和用户会话明确记录本次 TOTP 成功｜证据位置：internal/handlers/handler_sign_totp.go:221-231
++Rubric ID：5｜状态：通过｜期望行为：disable_reuse_security_policy 开启时继续允许同一时间步重用，并保持现有告警与认证语义。｜实际观察：占用失败且禁用重用保护时处理器记录既有告警并继续会话升级，没有返回重放错误。｜直接证据：internal/handlers/handler_sign_totp.go:165-176；TestShouldRedirectUserToSafeTargetURLDisableReusePolicy 与 TestShouldHandleExistsHistoryWithDisableReusePolicy 通过。
++Rubric ID：6｜状态：通过｜期望行为：无效验证码、不同时间步、正常单请求登录以及 TOTP 注册写入历史的既有行为不回归。｜实际观察：无效验证码仍记录失败并返回 403，正常单请求与会话 fixation 重建用例通过，注册路径仍调用既有 SaveTOTPHistory。｜直接证据：internal/handlers/handler_sign_totp.go:137-146；internal/handlers/handler_sign_totp_test.go；internal/handlers/handler_register_totp.go 未修改；handler 定向测试通过。
++
+diff --git a/evidence/verify_rubric.yaml b/evidence/verify_rubric.yaml
+new file mode 100644
+index 000000000..0cadcecfc
+--- /dev/null
++++ b/evidence/verify_rubric.yaml
+@@ -0,0 +1,20 @@
++rubrics:
++  - id: 1
++    type: f2p
++    text: 重用保护开启时，同一用户同一时间步的并发提交只有一个请求获得可用二因素会话。
++  - id: 2
++    type: f2p
++    text: 竞争失败的请求被稳定判定为验证码重放，不会泄露唯一约束或泛化存储错误。
++  - id: 3
++    type: f2p
++    text: 会话重建或保存失败后，不会留下永久消耗验证码但没有可用二因素会话的状态，并具有确定的重试恢复结果。
++  - id: 4
++    type: f2p
++    text: TOTP last_used_at、认证成功或失败日志、重放状态和会话终态不会互相矛盾。
++  - id: 5
++    type: p2p
++    text: disable_reuse_security_policy 开启时继续允许同一时间步重用，并保持现有告警与认证语义。
++  - id: 6
++    type: p2p
++    text: 无效验证码、不同时间步、正常单请求登录以及 TOTP 注册写入历史的既有行为不回归。
++
+diff --git a/internal/handlers/handler_sign_totp.go b/internal/handlers/handler_sign_totp.go
+index 623d691b8..de59fe197 100644
+--- a/internal/handlers/handler_sign_totp.go
++++ b/internal/handlers/handler_sign_totp.go
+@@ -74,11 +74,11 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
+ 	bodyJSON := bodySignTOTPRequest{}
+ 
+ 	var (
+-		userSession   session.UserSession
+-		config        *model.TOTPConfiguration
+-		valid, exists bool
+-		step          uint64
+-		err           error
++		userSession session.UserSession
++		config      *model.TOTPConfiguration
++		valid       bool
++		step        uint64
++		err         error
+ 	)
+ 	if userSession, err = ctx.GetSession(); err != nil {
+ 		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication: %s", errStrUserSessionData)
+@@ -145,8 +145,15 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
+ 		return
+ 	}
+ 
+-	if exists, err = ctx.Providers.StorageProvider.ExistsTOTPHistory(ctx, userSession.Username, step*uint64(config.Period)); err != nil {
+-		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred checking the TOTP history", userSession.Username)
++	step = step * uint64(config.Period)
++
++	// Atomically claim the step. The unique index on (username, step) makes the insert the single point of
++	// arbitration for concurrent requests presenting the same code: exactly one request claims the step and
++	// any concurrent or later request observes a replay instead of a storage error.
++	var claimed bool
++
++	if claimed, err = ctx.Providers.StorageProvider.ConsumeTOTPHistory(ctx, userSession.Username, step); err != nil {
++		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred saving the TOTP history to the storage backend", userSession.Username)
+ 
+ 		ctx.SetStatusCode(fasthttp.StatusForbidden)
+ 		ctx.SetJSONError(messageMFAValidationFailed)
+@@ -154,7 +161,7 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
+ 		return
+ 	}
+ 
+-	if exists {
++	if !claimed {
+ 		if ctx.Configuration.TOTP.DisableReuseSecurityPolicy {
+ 			ctx.GetLogger().WithFields(map[string]any{"username": userSession.Username}).Warn("User has reused a Time-based One Time Password with the given step but the policy to disable reuse is disabled")
+ 		} else {
+@@ -165,30 +172,25 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
+ 
+ 			return
+ 		}
+-	} else if err = ctx.Providers.StorageProvider.SaveTOTPHistory(ctx, userSession.Username, step*uint64(config.Period)); err != nil {
+-		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred saving the TOTP history to the storage backend", userSession.Username)
++	}
+ 
+-		ctx.SetStatusCode(fasthttp.StatusForbidden)
+-		ctx.SetJSONError(messageMFAValidationFailed)
++	// releaseClaim compensates for failures which occur after a successful claim but before a usable two-factor
++	// session exists, returning the still valid code to an unused state so the user may retry it instead of
++	// permanently losing it without a session.
++	releaseClaim := func(stage string) {
++		if !claimed {
++			return
++		}
+ 
+-		return
++		if rerr := ctx.Providers.StorageProvider.ReleaseTOTPHistory(ctx, userSession.Username, step); rerr != nil {
++			ctx.GetLogger().WithError(rerr).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred releasing the claimed TOTP history after the %s failed and the code may not be able to be retried", userSession.Username, stage)
++		}
+ 	}
+ 
+-	doMarkAuthenticationAttempt(ctx, true, regulation.NewBan(regulation.BanTypeNone, userSession.Username, nil), regulation.AuthTypeTOTP, nil)
+-
+ 	if err = ctx.RegenerateSession(); err != nil {
+ 		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error regenerating the user session", userSession.Username)
+ 
+-		ctx.SetStatusCode(fasthttp.StatusForbidden)
+-		ctx.SetJSONError(messageMFAValidationFailed)
+-
+-		return
+-	}
+-
+-	config.UpdateSignInInfo(ctx.GetClock().Now())
+-
+-	if err = ctx.Providers.StorageProvider.UpdateTOTPConfigurationSignIn(ctx, config.ID, config.LastUsedAt); err != nil {
+-		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred saving the credential sign-in information to the storage backend", userSession.Username)
++		releaseClaim("session regeneration")
+ 
+ 		ctx.SetStatusCode(fasthttp.StatusForbidden)
+ 		ctx.SetJSONError(messageMFAValidationFailed)
+@@ -201,12 +203,27 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
+ 	if err = ctx.SaveSession(userSession); err != nil {
+ 		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': %s", userSession.Username, errStrUserSessionDataSave)
+ 
++		releaseClaim("user session save")
++
+ 		ctx.SetStatusCode(fasthttp.StatusForbidden)
+ 		ctx.SetJSONError(messageMFAValidationFailed)
+ 
+ 		return
+ 	}
+ 
++	// Commit point: a usable two-factor session now exists. The credential last-used information and the
++	// successful authentication record both describe this committed result, so a failure recording either of
++	// them is logged but does not invalidate the session and cannot leave a failure response with the code
++	// burned.
++
++	config.UpdateSignInInfo(ctx.GetClock().Now())
++
++	if err = ctx.Providers.StorageProvider.UpdateTOTPConfigurationSignIn(ctx, config.ID, config.LastUsedAt); err != nil {
++		ctx.GetLogger().WithError(err).Errorf("Failed to update the TOTP credential sign-in information for user '%s'", userSession.Username)
++	}
++
++	doMarkAuthenticationAttempt(ctx, true, regulation.NewBan(regulation.BanTypeNone, userSession.Username, nil), regulation.AuthTypeTOTP, nil)
++
+ 	if len(bodyJSON.Flow) > 0 {
+ 		handleFlowResponse(ctx, &userSession, bodyJSON.FlowID, bodyJSON.Flow, bodyJSON.SubFlow, bodyJSON.UserCode)
+ 	} else {
+diff --git a/internal/handlers/handler_sign_totp_test.go b/internal/handlers/handler_sign_totp_test.go
+index 08402818d..44e4c6c31 100644
+--- a/internal/handlers/handler_sign_totp_test.go
++++ b/internal/handlers/handler_sign_totp_test.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/authelia/authelia/v4/internal/mocks"
+ 	"github.com/authelia/authelia/v4/internal/model"
+ 	"github.com/authelia/authelia/v4/internal/regulation"
++	"github.com/authelia/authelia/v4/internal/session/memory"
+ 	"github.com/authelia/authelia/v4/internal/storage"
+ )
+ 
+@@ -68,11 +69,11 @@ func (s *HandlerSignTOTPSuite) TestShouldRedirectUserToDefaultURL() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -85,10 +86,6 @@ func (s *HandlerSignTOTPSuite) TestShouldRedirectUserToDefaultURL() {
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	s.mock.Ctx.Configuration.Session.Cookies[0].DefaultRedirectionURL = testRedirectionURL
+@@ -105,7 +102,7 @@ func (s *HandlerSignTOTPSuite) TestShouldRedirectUserToDefaultURL() {
+ 	})
+ }
+ 
+-func (s *HandlerSignTOTPSuite) TestShouldFailWhenTOTPSignInInfoFailsToUpdate() {
++func (s *HandlerSignTOTPSuite) TestShouldNotFailWhenTOTPSignInInfoFailsToUpdate() {
+ 	config := model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
+ 
+ 	gomock.InOrder(
+@@ -119,12 +116,12 @@ func (s *HandlerSignTOTPSuite) TestShouldFailWhenTOTPSignInInfoFailsToUpdate() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(nil),
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
++			Return(errors.New("failed to perform update")),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(model.AuthenticationAttempt{
+@@ -134,11 +131,8 @@ func (s *HandlerSignTOTPSuite) TestShouldFailWhenTOTPSignInInfoFailsToUpdate() {
+ 				Time:       s.mock.Clock.Now(),
+ 				Type:       regulation.AuthTypeTOTP,
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+-			})),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(errors.New("failed to perform update")),
++			})).
++			Return(nil),
+ 	)
+ 
+ 	s.mock.Ctx.Configuration.Session.Cookies[0].DefaultRedirectionURL = testRedirectionURL
+@@ -150,7 +144,14 @@ func (s *HandlerSignTOTPSuite) TestShouldFailWhenTOTPSignInInfoFailsToUpdate() {
+ 	s.mock.Ctx.Request.SetBody(bodyBytes)
+ 
+ 	TimeBasedOneTimePasswordPOST(s.mock.Ctx)
+-	s.mock.Assert403KO(s.T(), "Authentication failed, please retry later.")
++
++	// The two-factor session already exists when the credential last-used update fails, so the authentication
++	// remains successful: the code is kept consumed and the failure is only logged.
++	s.mock.Assert200OK(s.T(), redirectResponse{
++		Redirect: testRedirectionURLString,
++	})
++
++	s.AssertLastLogMessage("Failed to update the TOTP credential sign-in information for user 'john'", "failed to perform update")
+ }
+ 
+ func (s *HandlerSignTOTPSuite) TestShouldNotReturnRedirectURL() {
+@@ -167,11 +168,11 @@ func (s *HandlerSignTOTPSuite) TestShouldNotReturnRedirectURL() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -184,10 +185,6 @@ func (s *HandlerSignTOTPSuite) TestShouldNotReturnRedirectURL() {
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -222,11 +219,11 @@ func (s *HandlerSignTOTPSuite) TestShouldRedirectUserToSafeTargetURL() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -239,10 +236,6 @@ func (s *HandlerSignTOTPSuite) TestShouldRedirectUserToSafeTargetURL() {
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -283,11 +276,11 @@ func (s *HandlerSignTOTPSuite) TestShouldRedirectUserToSafeTargetURLDisableReuse
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -300,10 +293,6 @@ func (s *HandlerSignTOTPSuite) TestShouldRedirectUserToSafeTargetURLDisableReuse
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -331,11 +320,11 @@ func (s *HandlerSignTOTPSuite) TestShouldNotRedirectToUnsafeURL() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -348,10 +337,6 @@ func (s *HandlerSignTOTPSuite) TestShouldNotRedirectToUnsafeURL() {
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -380,11 +365,11 @@ func (s *HandlerSignTOTPSuite) TestShouldRegenerateSessionForPreventingSessionFi
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -397,10 +382,6 @@ func (s *HandlerSignTOTPSuite) TestShouldRegenerateSessionForPreventingSessionFi
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -420,7 +401,7 @@ func (s *HandlerSignTOTPSuite) TestShouldRegenerateSessionForPreventingSessionFi
+ 		string(s.mock.Ctx.Request.Header.Cookie("authelia_session")))
+ }
+ 
+-func (s *HandlerSignTOTPSuite) TestShouldHandleErrorSaveHistory() {
++func (s *HandlerSignTOTPSuite) TestShouldHandleErrorConsumeHistory() {
+ 	config := model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
+ 
+ 	gomock.InOrder(
+@@ -434,12 +415,8 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleErrorSaveHistory() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(fmt.Errorf("bad stuff")),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(false, fmt.Errorf("bad stuff")),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -454,37 +431,10 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleErrorSaveHistory() {
+ 	s.AssertLastLogMessage("Error occurred validating a TOTP authentication for user 'john': error occurred saving the TOTP history to the storage backend", "bad stuff")
+ }
+ 
+-func (s *HandlerSignTOTPSuite) TestShouldHandleErrorExistsHistory() {
+-	config := model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
+-
+-	gomock.InOrder(
+-		s.mock.StorageMock.
+-			EXPECT().
+-			LoadTOTPConfiguration(s.mock.Ctx, gomock.Any()).
+-			Return(&config, nil),
+-		s.mock.TOTPMock.
+-			EXPECT().
+-			Validate(s.mock.Ctx, gomock.Eq("123456"), gomock.Eq(&config)).
+-			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, fmt.Errorf("oh my")),
+-	)
+-
+-	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+-		Token: "123456",
+-	})
+-	s.Require().NoError(err)
+-	s.mock.Ctx.Request.SetBody(bodyBytes)
+-
+-	TimeBasedOneTimePasswordPOST(s.mock.Ctx)
+-	s.mock.Assert403KO(s.T(), "Authentication failed, please retry later.")
+-
+-	s.AssertLastLogMessage("Error occurred validating a TOTP authentication for user 'john': error occurred checking the TOTP history", "oh my")
+-}
+-
+-func (s *HandlerSignTOTPSuite) TestShouldHandleExistsHistory() {
++// TestShouldStablyIdentifyReplayedCode models the losing request when two tabs submit the same code at the same
++// time: ConsumeTOTPHistory reports the step was already claimed and the request is rejected as a replay rather
++// than surfacing a storage error.
++func (s *HandlerSignTOTPSuite) TestShouldStablyIdentifyReplayedCode() {
+ 	config := model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
+ 
+ 	gomock.InOrder(
+@@ -498,8 +448,8 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleExistsHistory() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(true, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(false, nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -726,11 +676,11 @@ func (s *HandlerSignTOTPSuite) TestShouldNotReturnErrorOnInvalidBooleanMarkErrSu
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -743,10 +693,6 @@ func (s *HandlerSignTOTPSuite) TestShouldNotReturnErrorOnInvalidBooleanMarkErrSu
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			}).
+ 			Return(fmt.Errorf("failed to insert")),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{
+@@ -832,8 +778,12 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleExistsHistoryWithDisableReusePoli
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(true, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(false, nil),
++		s.mock.StorageMock.
++			EXPECT().
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
++			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(model.AuthenticationAttempt{
+@@ -845,10 +795,6 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleExistsHistoryWithDisableReusePoli
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{Token: "123456"})
+@@ -876,11 +822,11 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleFlow() {
+ 			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			ExistsTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
+-			Return(false, nil),
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+-			SaveTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+ 			Return(nil),
+ 		s.mock.StorageMock.
+ 			EXPECT().
+@@ -893,10 +839,6 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleFlow() {
+ 				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
+ 			})).
+ 			Return(nil),
+-		s.mock.StorageMock.
+-			EXPECT().
+-			UpdateTOTPConfigurationSignIn(s.mock.Ctx, gomock.Any(), gomock.Any()).
+-			Return(nil),
+ 	)
+ 
+ 	bodyBytes, err := json.Marshal(bodySignTOTPRequest{Token: "123456", Flow: "not-a-flow"})
+@@ -910,6 +852,178 @@ func (s *HandlerSignTOTPSuite) TestShouldHandleFlow() {
+ 	s.AssertLastLogMessage("Failed to find flow handler for the given flow parameters", "")
+ }
+ 
++// failingTOTPSessionBackend wraps the in-memory session backend so individual session operations can fail for
++// the post-claim failure tests.
++type failingTOTPSessionBackend struct {
++	*memory.Provider
++
++	saveErr       error
++	regenerateErr error
++}
++
++func (p *failingTOTPSessionBackend) Save(id, data []byte, expiration time.Duration) error {
++	if p.saveErr != nil {
++		return p.saveErr
++	}
++
++	return p.Provider.Save(id, data, expiration)
++}
++
++func (p *failingTOTPSessionBackend) Regenerate(id, newID []byte, expiration time.Duration) error {
++	if p.regenerateErr != nil {
++		return p.regenerateErr
++	}
++
++	return p.Provider.Regenerate(id, newID, expiration)
++}
++
++func (s *HandlerSignTOTPSuite) setFailingSessionBackend(saveErr, regenerateErr error) {
++	backend, err := memory.New(memory.Config{})
++	s.Require().NoError(err)
++
++	domainSession, err := s.mock.Ctx.Providers.SessionProvider.Get("example.com")
++	s.Require().NoError(err)
++
++	failing := &failingTOTPSessionBackend{Provider: backend}
++	s.Require().NoError(domainSession.SetProvider(failing))
++
++	// Seed the one-factor session into the new backend while all operations are still healthy, then arm the
++	// failures the test is interested in.
++	userSession, err := s.mock.Ctx.GetSession()
++	s.Require().NoError(err)
++
++	userSession.Username = testUsername
++	userSession.AuthenticationMethodRefs.UsernameAndPassword = true
++	s.Require().NoError(s.mock.Ctx.SaveSession(userSession))
++
++	failing.saveErr = saveErr
++	failing.regenerateErr = regenerateErr
++}
++
++func (s *HandlerSignTOTPSuite) totpHistoryCompensationMocks(config *model.TOTPConfiguration) {
++	gomock.InOrder(
++		s.mock.StorageMock.
++			EXPECT().
++			LoadTOTPConfiguration(s.mock.Ctx, gomock.Any()).
++			Return(config, nil),
++		s.mock.TOTPMock.
++			EXPECT().
++			Validate(s.mock.Ctx, gomock.Eq("123456"), gomock.Eq(config)).
++			Return(true, getStepTOTP(s.mock.Ctx, -1), nil),
++		s.mock.StorageMock.
++			EXPECT().
++			ConsumeTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
++		s.mock.StorageMock.
++			EXPECT().
++			ReleaseTOTPHistory(s.mock.Ctx, testUsername, uint64(1701295890)).
++			Return(nil),
++	)
++}
++
++func (s *HandlerSignTOTPSuite) TestShouldReleaseHistoryWhenSessionRegenerationFails() {
++	config := &model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
++
++	s.setFailingSessionBackend(nil, errors.New("session regenerate failed"))
++
++	s.totpHistoryCompensationMocks(config)
++
++	bodyBytes, err := json.Marshal(bodySignTOTPRequest{Token: "123456"})
++	s.Require().NoError(err)
++	s.mock.Ctx.Request.SetBody(bodyBytes)
++
++	TimeBasedOneTimePasswordPOST(s.mock.Ctx)
++	s.mock.Assert403KO(s.T(), "Authentication failed, please retry later.")
++
++	s.AssertLastLogMessage("Error occurred validating a TOTP authentication for user 'john': error regenerating the user session", "session regenerate failed")
++}
++
++func (s *HandlerSignTOTPSuite) TestShouldReleaseHistoryWhenSessionSaveFails() {
++	config := &model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
++
++	s.setFailingSessionBackend(errors.New("session save failed"), nil)
++
++	s.totpHistoryCompensationMocks(config)
++
++	bodyBytes, err := json.Marshal(bodySignTOTPRequest{Token: "123456"})
++	s.Require().NoError(err)
++	s.mock.Ctx.Request.SetBody(bodyBytes)
++
++	TimeBasedOneTimePasswordPOST(s.mock.Ctx)
++	s.mock.Assert403KO(s.T(), "Authentication failed, please retry later.")
++
++	s.AssertLastLogMessage("Error occurred validating a TOTP authentication for user 'john': error occurred saving the user session data", "session save failed")
++}
++
++// TestShouldAllowRetryingSameCodeAfterElevationFailure ensures that after a session save failure the released
++// code can be presented again on a new request and complete the authentication, i.e. the failure response is
++// retryable instead of permanently burning the still valid code.
++func (s *HandlerSignTOTPSuite) TestShouldAllowRetryingSameCodeAfterElevationFailure() {
++	first := &model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
++
++	s.setFailingSessionBackend(errors.New("session save failed"), nil)
++
++	s.totpHistoryCompensationMocks(first)
++
++	bodyBytes, err := json.Marshal(bodySignTOTPRequest{Token: "123456"})
++	s.Require().NoError(err)
++	s.mock.Ctx.Request.SetBody(bodyBytes)
++
++	TimeBasedOneTimePasswordPOST(s.mock.Ctx)
++	s.mock.Assert403KO(s.T(), "Authentication failed, please retry later.")
++
++	retry := mocks.NewMockAutheliaCtx(s.T())
++	defer retry.Close()
++
++	userSession, err := retry.Ctx.GetSession()
++	s.Require().NoError(err)
++
++	userSession.Username = testUsername
++	userSession.AuthenticationMethodRefs.UsernameAndPassword = true
++	s.Require().NoError(retry.Ctx.SaveSession(userSession))
++
++	retry.Clock.Set(time.Unix(1701295903, 0))
++	retry.Ctx.Providers.Clock = &retry.Clock
++	retry.Ctx.Configuration.TOTP = schema.DefaultTOTPConfiguration
++
++	second := model.TOTPConfiguration{ID: 1, Username: testUsername, Digits: 6, Secret: []byte("secret"), Period: 30, Algorithm: "SHA1"}
++
++	gomock.InOrder(
++		retry.StorageMock.
++			EXPECT().
++			LoadTOTPConfiguration(retry.Ctx, gomock.Any()).
++			Return(&second, nil),
++		retry.TOTPMock.
++			EXPECT().
++			Validate(retry.Ctx, gomock.Eq("123456"), gomock.Eq(&second)).
++			Return(true, getStepTOTP(retry.Ctx, -1), nil),
++		retry.StorageMock.
++			EXPECT().
++			ConsumeTOTPHistory(retry.Ctx, testUsername, uint64(1701295890)).
++			Return(true, nil),
++		retry.StorageMock.
++			EXPECT().
++			UpdateTOTPConfigurationSignIn(retry.Ctx, gomock.Any(), gomock.Any()).
++			Return(nil),
++		retry.StorageMock.
++			EXPECT().
++			AppendAuthenticationLog(retry.Ctx, gomock.Eq(model.AuthenticationAttempt{
++				Username:   testUsername,
++				Successful: true,
++				Banned:     false,
++				Time:       retry.Clock.Now(),
++				Type:       regulation.AuthTypeTOTP,
++				RemoteIP:   model.NewNullIPFromString("0.0.0.0"),
++			})).
++			Return(nil),
++	)
++
++	retry.Ctx.Request.SetBody(bodyBytes)
++
++	TimeBasedOneTimePasswordPOST(retry.Ctx)
++	retry.Assert200OK(s.T(), redirectResponse{Redirect: "https://www.example.com"})
++}
++
+ func TestRunHandlerSignTOTPSuite(t *testing.T) {
+ 	suite.Run(t, new(HandlerSignTOTPSuite))
+ }
+diff --git a/internal/mocks/storage.go b/internal/mocks/storage.go
+index c49c594a8..24691326e 100644
+--- a/internal/mocks/storage.go
++++ b/internal/mocks/storage.go
+@@ -134,6 +134,21 @@ func (mr *MockStorageMockRecorder) ConsumeOneTimeCode(ctx, code any) *gomock.Cal
+ 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ConsumeOneTimeCode", reflect.TypeOf((*MockStorage)(nil).ConsumeOneTimeCode), ctx, code)
+ }
+ 
++// ConsumeTOTPHistory mocks base method.
++func (m *MockStorage) ConsumeTOTPHistory(ctx context.Context, username string, step uint64) (bool, error) {
++	m.ctrl.T.Helper()
++	ret := m.ctrl.Call(m, "ConsumeTOTPHistory", ctx, username, step)
++	ret0, _ := ret[0].(bool)
++	ret1, _ := ret[1].(error)
++	return ret0, ret1
++}
++
++// ConsumeTOTPHistory indicates an expected call of ConsumeTOTPHistory.
++func (mr *MockStorageMockRecorder) ConsumeTOTPHistory(ctx, username, step any) *gomock.Call {
++	mr.mock.ctrl.T.Helper()
++	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ConsumeTOTPHistory", reflect.TypeOf((*MockStorage)(nil).ConsumeTOTPHistory), ctx, username, step)
++}
++
+ // DeactivateOAuth2DeviceCodeSession mocks base method.
+ func (m *MockStorage) DeactivateOAuth2DeviceCodeSession(ctx context.Context, signature string) error {
+ 	m.ctrl.T.Helper()
+@@ -816,6 +831,20 @@ func (mr *MockStorageMockRecorder) LoadWebAuthnUserByUserID(ctx, rpid, userID an
+ 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LoadWebAuthnUserByUserID", reflect.TypeOf((*MockStorage)(nil).LoadWebAuthnUserByUserID), ctx, rpid, userID)
+ }
+ 
++// ReleaseTOTPHistory mocks base method.
++func (m *MockStorage) ReleaseTOTPHistory(ctx context.Context, username string, step uint64) error {
++	m.ctrl.T.Helper()
++	ret := m.ctrl.Call(m, "ReleaseTOTPHistory", ctx, username, step)
++	ret0, _ := ret[0].(error)
++	return ret0
++}
++
++// ReleaseTOTPHistory indicates an expected call of ReleaseTOTPHistory.
++func (mr *MockStorageMockRecorder) ReleaseTOTPHistory(ctx, username, step any) *gomock.Call {
++	mr.mock.ctrl.T.Helper()
++	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReleaseTOTPHistory", reflect.TypeOf((*MockStorage)(nil).ReleaseTOTPHistory), ctx, username, step)
++}
++
+ // RevokeBannedIP mocks base method.
+ func (m *MockStorage) RevokeBannedIP(ctx context.Context, id int, expired time.Time) error {
+ 	m.ctrl.T.Helper()
+diff --git a/internal/session/session.go b/internal/session/session.go
+index 31ad40fed..f328fdbd9 100644
+--- a/internal/session/session.go
++++ b/internal/session/session.go
+@@ -81,11 +81,16 @@ func (p *Session) SaveSession(ctx *fasthttp.RequestCtx, userSession UserSession)
+ 	return nil
+ }
+ 
+-// RegenerateSession regenerate a session ID.
++// RegenerateSession regenerates a session ID.
+ func (p *Session) RegenerateSession(ctx *fasthttp.RequestCtx) error {
+ 	return p.sessionHolder.Regenerate(ctx)
+ }
+ 
++// SetProvider replaces the underlying session store provider.
++func (p *Session) SetProvider(provider session.Provider) error {
++	return p.sessionHolder.SetProvider(provider)
++}
++
+ // DestroySession destroy a session ID and delete the cookie.
+ func (p *Session) DestroySession(ctx *fasthttp.RequestCtx) error {
+ 	return p.sessionHolder.Destroy(ctx)
+diff --git a/internal/storage/provider.go b/internal/storage/provider.go
+index d2c3aa55b..d9e0edbb4 100644
+--- a/internal/storage/provider.go
++++ b/internal/storage/provider.go
+@@ -82,6 +82,18 @@ type Provider interface {
+ 	// SaveTOTPHistory saves a TOTP history item in the storage provider.
+ 	SaveTOTPHistory(ctx context.Context, username string, step uint64) (err error)
+ 
++	// ConsumeTOTPHistory atomically records usage of a TOTP step for a user. It returns consumed=true when this
++	// call creates the record, meaning the caller has claimed the step and may complete the authentication. It
++	// returns consumed=false with a nil error when the step has already been recorded by an earlier or concurrent
++	// authentication, which indicates a replay. The atomic insert against the unique index is the single
++	// arbitration point for concurrent requests using the same code.
++	ConsumeTOTPHistory(ctx context.Context, username string, step uint64) (consumed bool, err error)
++
++	// ReleaseTOTPHistory removes a TOTP history record previously claimed with ConsumeTOTPHistory, returning the
++	// step to an unused state. This compensates for failures which occur after a successful claim but before a
++	// usable two-factor session exists, allowing a still valid code to be retried.
++	ReleaseTOTPHistory(ctx context.Context, username string, step uint64) (err error)
++
+ 	// ExistsTOTPHistory checks if a TOTP history item exists in the storage provider.
+ 	ExistsTOTPHistory(ctx context.Context, username string, step uint64) (exists bool, err error)
+ 
+diff --git a/internal/storage/sql_provider.go b/internal/storage/sql_provider.go
+index 2ada02f7c..aba1d8375 100644
+--- a/internal/storage/sql_provider.go
++++ b/internal/storage/sql_provider.go
+@@ -110,6 +110,7 @@ func NewSQLProvider(config *schema.Configuration, name, driverName, dataSourceNa
+ 		sqlUpdateTOTPConfigRecordSignInByUsername: fmt.Sprintf(queryFmtUpdateTOTPConfigRecordSignInByUsername, tableTOTPConfigurations),
+ 
+ 		sqlInsertTOTPHistory: fmt.Sprintf(queryFmtInsertTOTPHistory, tableTOTPHistory),
++		sqlDeleteTOTPHistory: fmt.Sprintf(queryFmtDeleteTOTPHistory, tableTOTPHistory),
+ 		sqlSelectTOTPHistory: fmt.Sprintf(queryFmtSelectTOTPHistory, tableTOTPHistory),
+ 
+ 		sqlInsertWebAuthnUser:         fmt.Sprintf(queryFmtInsertWebAuthnUser, tableWebAuthnUsers),
+@@ -280,6 +281,7 @@ type SQLProvider struct {
+ 
+ 	// Table: totp_history.
+ 	sqlInsertTOTPHistory string
++	sqlDeleteTOTPHistory string
+ 	sqlSelectTOTPHistory string
+ 
+ 	// Table: webauthn_users.
+@@ -670,6 +672,35 @@ func (p *SQLProvider) SaveTOTPHistory(ctx context.Context, username string, step
+ 	return nil
+ }
+ 
++// ConsumeTOTPHistory attempts to atomically claim a TOTP step by inserting the history record. The unique index
++// on (username, step) arbitrates concurrent attempts: a unique constraint violation means the step was already
++// recorded by a concurrent or earlier authentication and is reported as consumed=false instead of an error so
++// that repliers are identified deterministically instead of being surfaced as storage failures.
++func (p *SQLProvider) ConsumeTOTPHistory(ctx context.Context, username string, step uint64) (consumed bool, err error) {
++	signature := p.otpHMACSignature([]byte(strconv.FormatUint(step, 10)), []byte(username))
++
++	if _, err = p.conn(ctx).ExecContext(ctx, p.sqlInsertTOTPHistory, username, signature); err != nil {
++		if IsUniqueConstraintViolation(err) {
++			return false, nil
++		}
++
++		return false, fmt.Errorf("error inserting TOTP history for user '%s': %w", username, err)
++	}
++
++	return true, nil
++}
++
++// ReleaseTOTPHistory removes a previously claimed TOTP history record so the step can be consumed again.
++func (p *SQLProvider) ReleaseTOTPHistory(ctx context.Context, username string, step uint64) (err error) {
++	signature := p.otpHMACSignature([]byte(strconv.FormatUint(step, 10)), []byte(username))
++
++	if _, err = p.conn(ctx).ExecContext(ctx, p.sqlDeleteTOTPHistory, username, signature); err != nil {
++		return fmt.Errorf("error deleting TOTP history for user '%s': %w", username, err)
++	}
++
++	return nil
++}
++
+ // ExistsTOTPHistory checks if a TOTP history item exists in the storage provider.
+ func (p *SQLProvider) ExistsTOTPHistory(ctx context.Context, username string, step uint64) (exists bool, err error) {
+ 	var count int
+diff --git a/internal/storage/sql_provider_backend_postgres.go b/internal/storage/sql_provider_backend_postgres.go
+index 333346f3f..5aaf06df3 100644
+--- a/internal/storage/sql_provider_backend_postgres.go
++++ b/internal/storage/sql_provider_backend_postgres.go
+@@ -81,6 +81,7 @@ func NewPostgreSQLProvider(config *schema.Configuration, caCertPool *x509.CertPo
+ 	provider.sqlSelectTOTPConfigs = provider.db.Rebind(provider.sqlSelectTOTPConfigs)
+ 
+ 	provider.sqlInsertTOTPHistory = provider.db.Rebind(provider.sqlInsertTOTPHistory)
++	provider.sqlDeleteTOTPHistory = provider.db.Rebind(provider.sqlDeleteTOTPHistory)
+ 	provider.sqlSelectTOTPHistory = provider.db.Rebind(provider.sqlSelectTOTPHistory)
+ 
+ 	provider.sqlInsertWebAuthnUser = provider.db.Rebind(provider.sqlInsertWebAuthnUser)
+diff --git a/internal/storage/sql_provider_queries.go b/internal/storage/sql_provider_queries.go
+index fd5111df8..6a012a380 100644
+--- a/internal/storage/sql_provider_queries.go
++++ b/internal/storage/sql_provider_queries.go
+@@ -176,6 +176,10 @@ const (
+ 		INSERT INTO %s (username, step)
+ 		VALUES (?, ?);`
+ 
++	queryFmtDeleteTOTPHistory = `
++		DELETE FROM %s
++		WHERE username = ? AND step = ?;`
++
+ 	queryFmtSelectTOTPHistory = `
+ 		SELECT COUNT(id)
+ 		FROM %s
+diff --git a/internal/storage/sql_provider_test.go b/internal/storage/sql_provider_test.go
+index 7ce37eb2e..8c854eb67 100644
+--- a/internal/storage/sql_provider_test.go
++++ b/internal/storage/sql_provider_test.go
+@@ -10,6 +10,8 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"path/filepath"
++	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -232,6 +234,115 @@ func TestSQLProviderTOTPConfiguration(t *testing.T) {
+ 		assert.NoError(t, err)
+ 		assert.False(t, exists)
+ 	})
++
++	t.Run("ShouldConsumeAndReleaseHistory", func(t *testing.T) {
++		consumed, err := provider.ConsumeTOTPHistory(ctx, "alice", 54321)
++		require.NoError(t, err)
++		assert.True(t, consumed)
++
++		// The same step cannot be claimed a second time and is reported as a replay rather than an error.
++		consumed, err = provider.ConsumeTOTPHistory(ctx, "alice", 54321)
++		require.NoError(t, err)
++		assert.False(t, consumed)
++
++		// A different step and a different user are unaffected by the claim.
++		consumed, err = provider.ConsumeTOTPHistory(ctx, "alice", 54322)
++		require.NoError(t, err)
++		assert.True(t, consumed)
++
++		consumed, err = provider.ConsumeTOTPHistory(ctx, "bob", 54321)
++		require.NoError(t, err)
++		assert.True(t, consumed)
++
++		exists, err := provider.ExistsTOTPHistory(ctx, "alice", 54321)
++		require.NoError(t, err)
++		assert.True(t, exists)
++
++		// Releasing returns the step to an unused state so it can be claimed again.
++		require.NoError(t, provider.ReleaseTOTPHistory(ctx, "alice", 54321))
++
++		exists, err = provider.ExistsTOTPHistory(ctx, "alice", 54321)
++		require.NoError(t, err)
++		assert.False(t, exists)
++
++		consumed, err = provider.ConsumeTOTPHistory(ctx, "alice", 54321)
++		require.NoError(t, err)
++		assert.True(t, consumed)
++	})
++
++	t.Run("ShouldConsumeHistoryOnceConcurrently", func(t *testing.T) {
++		const competitors = 32
++
++		for _, step := range []uint64{65000, 65001} {
++			var (
++				barrier sync.WaitGroup
++				wg      sync.WaitGroup
++				winners int64
++			)
++
++			barrier.Add(1)
++
++			results := make(chan bool, competitors)
++			errCh := make(chan error, competitors)
++
++			for i := 0; i < competitors; i++ {
++				wg.Add(1)
++
++				go func() {
++					defer wg.Done()
++
++					barrier.Wait()
++
++					// Contention may surface as a busy/locked serialization failure, which is a retriable
++					// condition rather than a claim result, so retry it as a caller would.
++					for attempt := 0; attempt < 100; attempt++ {
++						consumed, err := provider.ConsumeTOTPHistory(context.Background(), "claire", step)
++						if err != nil {
++							if IsSerializationFailure(err) {
++								time.Sleep(time.Millisecond)
++
++								continue
++							}
++
++							errCh <- err
++
++							return
++						}
++
++						results <- consumed
++
++						return
++					}
++
++					errCh <- fmt.Errorf("timed out retrying serialization failures")
++				}()
++			}
++
++			barrier.Done()
++			wg.Wait()
++			close(results)
++			close(errCh)
++
++			for err := range errCh {
++				assert.NoError(t, err)
++			}
++
++			for consumed := range results {
++				if consumed {
++					atomic.AddInt64(&winners, 1)
++				}
++			}
++
++			assert.Equal(t, int64(1), winners, "exactly one concurrent request must claim step %d", step)
++
++			// After releasing the claimed step it is claimable again.
++			require.NoError(t, provider.ReleaseTOTPHistory(context.Background(), "claire", step))
++
++			consumed, err := provider.ConsumeTOTPHistory(context.Background(), "claire", step)
++			require.NoError(t, err)
++			assert.True(t, consumed)
++		}
++	})
+ }
+ 
+ func TestSQLProviderTransactions(t *testing.T) {

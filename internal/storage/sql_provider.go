@@ -110,6 +110,7 @@ func NewSQLProvider(config *schema.Configuration, name, driverName, dataSourceNa
 		sqlUpdateTOTPConfigRecordSignInByUsername: fmt.Sprintf(queryFmtUpdateTOTPConfigRecordSignInByUsername, tableTOTPConfigurations),
 
 		sqlInsertTOTPHistory: fmt.Sprintf(queryFmtInsertTOTPHistory, tableTOTPHistory),
+		sqlDeleteTOTPHistory: fmt.Sprintf(queryFmtDeleteTOTPHistory, tableTOTPHistory),
 		sqlSelectTOTPHistory: fmt.Sprintf(queryFmtSelectTOTPHistory, tableTOTPHistory),
 
 		sqlInsertWebAuthnUser:         fmt.Sprintf(queryFmtInsertWebAuthnUser, tableWebAuthnUsers),
@@ -280,6 +281,7 @@ type SQLProvider struct {
 
 	// Table: totp_history.
 	sqlInsertTOTPHistory string
+	sqlDeleteTOTPHistory string
 	sqlSelectTOTPHistory string
 
 	// Table: webauthn_users.
@@ -665,6 +667,35 @@ func (p *SQLProvider) SaveTOTPHistory(ctx context.Context, username string, step
 
 	if _, err = p.conn(ctx).ExecContext(ctx, p.sqlInsertTOTPHistory, username, signature); err != nil {
 		return fmt.Errorf("error inserting TOTP history for user '%s': %w", username, err)
+	}
+
+	return nil
+}
+
+// ConsumeTOTPHistory attempts to atomically claim a TOTP step by inserting the history record. The unique index
+// on (username, step) arbitrates concurrent attempts: a unique constraint violation means the step was already
+// recorded by a concurrent or earlier authentication and is reported as consumed=false instead of an error so
+// that repliers are identified deterministically instead of being surfaced as storage failures.
+func (p *SQLProvider) ConsumeTOTPHistory(ctx context.Context, username string, step uint64) (consumed bool, err error) {
+	signature := p.otpHMACSignature([]byte(strconv.FormatUint(step, 10)), []byte(username))
+
+	if _, err = p.conn(ctx).ExecContext(ctx, p.sqlInsertTOTPHistory, username, signature); err != nil {
+		if IsUniqueConstraintViolation(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("error inserting TOTP history for user '%s': %w", username, err)
+	}
+
+	return true, nil
+}
+
+// ReleaseTOTPHistory removes a previously claimed TOTP history record so the step can be consumed again.
+func (p *SQLProvider) ReleaseTOTPHistory(ctx context.Context, username string, step uint64) (err error) {
+	signature := p.otpHMACSignature([]byte(strconv.FormatUint(step, 10)), []byte(username))
+
+	if _, err = p.conn(ctx).ExecContext(ctx, p.sqlDeleteTOTPHistory, username, signature); err != nil {
+		return fmt.Errorf("error deleting TOTP history for user '%s': %w", username, err)
 	}
 
 	return nil

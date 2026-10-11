@@ -176,6 +176,10 @@ const (
 		INSERT INTO %s (username, step)
 		VALUES (?, ?);`
 
+	queryFmtDeleteTOTPHistory = `
+		DELETE FROM %s
+		WHERE username = ? AND step = ?;`
+
 	queryFmtSelectTOTPHistory = `
 		SELECT COUNT(id)
 		FROM %s

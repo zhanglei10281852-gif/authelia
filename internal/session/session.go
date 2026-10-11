@@ -81,9 +81,14 @@ func (p *Session) SaveSession(ctx *fasthttp.RequestCtx, userSession UserSession)
 	return nil
 }
 
-// RegenerateSession regenerate a session ID.
+// RegenerateSession regenerates a session ID.
 func (p *Session) RegenerateSession(ctx *fasthttp.RequestCtx) error {
 	return p.sessionHolder.Regenerate(ctx)
+}
+
+// SetProvider replaces the underlying session store provider.
+func (p *Session) SetProvider(provider session.Provider) error {
+	return p.sessionHolder.SetProvider(provider)
 }
 
 // DestroySession destroy a session ID and delete the cookie.

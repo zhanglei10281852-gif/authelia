@@ -82,6 +82,18 @@ type Provider interface {
 	// SaveTOTPHistory saves a TOTP history item in the storage provider.
 	SaveTOTPHistory(ctx context.Context, username string, step uint64) (err error)
 
+	// ConsumeTOTPHistory atomically records usage of a TOTP step for a user. It returns consumed=true when this
+	// call creates the record, meaning the caller has claimed the step and may complete the authentication. It
+	// returns consumed=false with a nil error when the step has already been recorded by an earlier or concurrent
+	// authentication, which indicates a replay. The atomic insert against the unique index is the single
+	// arbitration point for concurrent requests using the same code.
+	ConsumeTOTPHistory(ctx context.Context, username string, step uint64) (consumed bool, err error)
+
+	// ReleaseTOTPHistory removes a TOTP history record previously claimed with ConsumeTOTPHistory, returning the
+	// step to an unused state. This compensates for failures which occur after a successful claim but before a
+	// usable two-factor session exists, allowing a still valid code to be retried.
+	ReleaseTOTPHistory(ctx context.Context, username string, step uint64) (err error)
+
 	// ExistsTOTPHistory checks if a TOTP history item exists in the storage provider.
 	ExistsTOTPHistory(ctx context.Context, username string, step uint64) (exists bool, err error)
 

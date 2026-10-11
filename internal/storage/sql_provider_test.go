@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -231,6 +233,115 @@ func TestSQLProviderTOTPConfiguration(t *testing.T) {
 
 		assert.NoError(t, err)
 		assert.False(t, exists)
+	})
+
+	t.Run("ShouldConsumeAndReleaseHistory", func(t *testing.T) {
+		consumed, err := provider.ConsumeTOTPHistory(ctx, "alice", 54321)
+		require.NoError(t, err)
+		assert.True(t, consumed)
+
+		// The same step cannot be claimed a second time and is reported as a replay rather than an error.
+		consumed, err = provider.ConsumeTOTPHistory(ctx, "alice", 54321)
+		require.NoError(t, err)
+		assert.False(t, consumed)
+
+		// A different step and a different user are unaffected by the claim.
+		consumed, err = provider.ConsumeTOTPHistory(ctx, "alice", 54322)
+		require.NoError(t, err)
+		assert.True(t, consumed)
+
+		consumed, err = provider.ConsumeTOTPHistory(ctx, "bob", 54321)
+		require.NoError(t, err)
+		assert.True(t, consumed)
+
+		exists, err := provider.ExistsTOTPHistory(ctx, "alice", 54321)
+		require.NoError(t, err)
+		assert.True(t, exists)
+
+		// Releasing returns the step to an unused state so it can be claimed again.
+		require.NoError(t, provider.ReleaseTOTPHistory(ctx, "alice", 54321))
+
+		exists, err = provider.ExistsTOTPHistory(ctx, "alice", 54321)
+		require.NoError(t, err)
+		assert.False(t, exists)
+
+		consumed, err = provider.ConsumeTOTPHistory(ctx, "alice", 54321)
+		require.NoError(t, err)
+		assert.True(t, consumed)
+	})
+
+	t.Run("ShouldConsumeHistoryOnceConcurrently", func(t *testing.T) {
+		const competitors = 32
+
+		for _, step := range []uint64{65000, 65001} {
+			var (
+				barrier sync.WaitGroup
+				wg      sync.WaitGroup
+				winners int64
+			)
+
+			barrier.Add(1)
+
+			results := make(chan bool, competitors)
+			errCh := make(chan error, competitors)
+
+			for i := 0; i < competitors; i++ {
+				wg.Add(1)
+
+				go func() {
+					defer wg.Done()
+
+					barrier.Wait()
+
+					// Contention may surface as a busy/locked serialization failure, which is a retriable
+					// condition rather than a claim result, so retry it as a caller would.
+					for attempt := 0; attempt < 100; attempt++ {
+						consumed, err := provider.ConsumeTOTPHistory(context.Background(), "claire", step)
+						if err != nil {
+							if IsSerializationFailure(err) {
+								time.Sleep(time.Millisecond)
+
+								continue
+							}
+
+							errCh <- err
+
+							return
+						}
+
+						results <- consumed
+
+						return
+					}
+
+					errCh <- fmt.Errorf("timed out retrying serialization failures")
+				}()
+			}
+
+			barrier.Done()
+			wg.Wait()
+			close(results)
+			close(errCh)
+
+			for err := range errCh {
+				assert.NoError(t, err)
+			}
+
+			for consumed := range results {
+				if consumed {
+					atomic.AddInt64(&winners, 1)
+				}
+			}
+
+			assert.Equal(t, int64(1), winners, "exactly one concurrent request must claim step %d", step)
+
+			// After releasing the claimed step it is claimable again.
+			require.NoError(t, provider.ReleaseTOTPHistory(context.Background(), "claire", step))
+
+			consumed, err := provider.ConsumeTOTPHistory(context.Background(), "claire", step)
+			require.NoError(t, err)
+			assert.True(t, consumed)
+		}
 	})
 }
 

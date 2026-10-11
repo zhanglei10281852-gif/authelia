@@ -74,11 +74,11 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
 	bodyJSON := bodySignTOTPRequest{}
 
 	var (
-		userSession   session.UserSession
-		config        *model.TOTPConfiguration
-		valid, exists bool
-		step          uint64
-		err           error
+		userSession session.UserSession
+		config      *model.TOTPConfiguration
+		valid       bool
+		step        uint64
+		err         error
 	)
 	if userSession, err = ctx.GetSession(); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication: %s", errStrUserSessionData)
@@ -145,8 +145,15 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
 		return
 	}
 
-	if exists, err = ctx.Providers.StorageProvider.ExistsTOTPHistory(ctx, userSession.Username, step*uint64(config.Period)); err != nil {
-		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred checking the TOTP history", userSession.Username)
+	step = step * uint64(config.Period)
+
+	// Atomically claim the step. The unique index on (username, step) makes the insert the single point of
+	// arbitration for concurrent requests presenting the same code: exactly one request claims the step and
+	// any concurrent or later request observes a replay instead of a storage error.
+	var claimed bool
+
+	if claimed, err = ctx.Providers.StorageProvider.ConsumeTOTPHistory(ctx, userSession.Username, step); err != nil {
+		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred saving the TOTP history to the storage backend", userSession.Username)
 
 		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		ctx.SetJSONError(messageMFAValidationFailed)
@@ -154,7 +161,7 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
 		return
 	}
 
-	if exists {
+	if !claimed {
 		if ctx.Configuration.TOTP.DisableReuseSecurityPolicy {
 			ctx.GetLogger().WithFields(map[string]any{"username": userSession.Username}).Warn("User has reused a Time-based One Time Password with the given step but the policy to disable reuse is disabled")
 		} else {
@@ -165,30 +172,25 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
 
 			return
 		}
-	} else if err = ctx.Providers.StorageProvider.SaveTOTPHistory(ctx, userSession.Username, step*uint64(config.Period)); err != nil {
-		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred saving the TOTP history to the storage backend", userSession.Username)
-
-		ctx.SetStatusCode(fasthttp.StatusForbidden)
-		ctx.SetJSONError(messageMFAValidationFailed)
-
-		return
 	}
 
-	doMarkAuthenticationAttempt(ctx, true, regulation.NewBan(regulation.BanTypeNone, userSession.Username, nil), regulation.AuthTypeTOTP, nil)
+	// releaseClaim compensates for failures which occur after a successful claim but before a usable two-factor
+	// session exists, returning the still valid code to an unused state so the user may retry it instead of
+	// permanently losing it without a session.
+	releaseClaim := func(stage string) {
+		if !claimed {
+			return
+		}
+
+		if rerr := ctx.Providers.StorageProvider.ReleaseTOTPHistory(ctx, userSession.Username, step); rerr != nil {
+			ctx.GetLogger().WithError(rerr).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred releasing the claimed TOTP history after the %s failed and the code may not be able to be retried", userSession.Username, stage)
+		}
+	}
 
 	if err = ctx.RegenerateSession(); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error regenerating the user session", userSession.Username)
 
-		ctx.SetStatusCode(fasthttp.StatusForbidden)
-		ctx.SetJSONError(messageMFAValidationFailed)
-
-		return
-	}
-
-	config.UpdateSignInInfo(ctx.GetClock().Now())
-
-	if err = ctx.Providers.StorageProvider.UpdateTOTPConfigurationSignIn(ctx, config.ID, config.LastUsedAt); err != nil {
-		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': error occurred saving the credential sign-in information to the storage backend", userSession.Username)
+		releaseClaim("session regeneration")
 
 		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		ctx.SetJSONError(messageMFAValidationFailed)
@@ -201,11 +203,26 @@ func TimeBasedOneTimePasswordPOST(ctx *middlewares.AutheliaCtx) {
 	if err = ctx.SaveSession(userSession); err != nil {
 		ctx.GetLogger().WithError(err).Errorf("Error occurred validating a TOTP authentication for user '%s': %s", userSession.Username, errStrUserSessionDataSave)
 
+		releaseClaim("user session save")
+
 		ctx.SetStatusCode(fasthttp.StatusForbidden)
 		ctx.SetJSONError(messageMFAValidationFailed)
 
 		return
 	}
+
+	// Commit point: a usable two-factor session now exists. The credential last-used information and the
+	// successful authentication record both describe this committed result, so a failure recording either of
+	// them is logged but does not invalidate the session and cannot leave a failure response with the code
+	// burned.
+
+	config.UpdateSignInInfo(ctx.GetClock().Now())
+
+	if err = ctx.Providers.StorageProvider.UpdateTOTPConfigurationSignIn(ctx, config.ID, config.LastUsedAt); err != nil {
+		ctx.GetLogger().WithError(err).Errorf("Failed to update the TOTP credential sign-in information for user '%s'", userSession.Username)
+	}
+
+	doMarkAuthenticationAttempt(ctx, true, regulation.NewBan(regulation.BanTypeNone, userSession.Username, nil), regulation.AuthTypeTOTP, nil)
 
 	if len(bodyJSON.Flow) > 0 {
 		handleFlowResponse(ctx, &userSession, bodyJSON.FlowID, bodyJSON.Flow, bodyJSON.SubFlow, bodyJSON.UserCode)
