@@ -147,6 +147,10 @@ func TestSchemaMigrateDownShouldMigrateWithoutStartupCheck(t *testing.T) {
 	provider, err := NewSQLiteProvider(config)
 	require.NoError(t, err)
 
+	t.Cleanup(func() {
+		_ = provider.Close()
+	})
+
 	require.NoError(t, provider.SchemaMigrate(ctx, false, 0))
 }
 
@@ -181,6 +185,10 @@ func TestSchemaMigrateDownToZeroShouldSucceedWithStaleEncryptionKey(t *testing.T
 
 	provider, err := NewSQLiteProvider(config)
 	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = provider.Close()
+	})
 
 	require.NoError(t, provider.SchemaMigrate(ctx, false, 0))
 }

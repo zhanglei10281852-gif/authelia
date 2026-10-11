@@ -1,0 +1,1341 @@
+diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
+new file mode 100644
+index 0000000..162e6c2
+--- /dev/null
++++ b/evidence/rubric-comparison.txt
+@@ -0,0 +1,9 @@
++项目：authelia-authelia-5b6622fe-35e2-4e8d-9779-12846be7fbb4｜并发登录失败下 Regulation 计数与有效封禁收敛
++验证摘要：go test -count=1 ./internal/storage -run '^TestSQLProviderRegulation' 通过；go test -count=1 ./internal/regulation -run '^TestHandleAttemptShortCircuits$|^TestRunRegulatorSuite$' 通过。
++Rubric ID：1｜状态：通过｜期望行为：达到阈值的并发失败请求对同一用户和同一 IP 各最多留下一个未撤销且未过期的 regulation ban。｜实际观察：并发决策在 serializable 事务内写入认证日志、读取阈值记录并写入用户和 IP ban，SQLite 的 8、16、32 并发验证均只留下各一个有效 ban。｜直接证据：internal/regulation/regulator.go:77-126；internal/storage/sql_provider.go:515-578；internal/storage/sql_provider_concurrency_test.go:233-386；定向测试通过。
++Rubric ID：2｜状态：通过｜期望行为：认证日志写入失败时本次尝试不参与阈值派生，也不会创建新的用户或 IP ban。｜实际观察：AppendAuthenticationLog 是事务回调的首个写操作，返回错误后立即退出回调，后续阈值读取和两个 ban 写入均不执行。｜直接证据：internal/regulation/regulator.go:81-85；internal/storage/sql_provider.go:546-553；TestSQLProviderRegulationTransactionRecovery 通过。
++Rubric ID：3｜状态：未通过｜期望行为：user 与 ip 模式同时启用时任一派生写入失败不会留下只属于本次决策的单边有效 ban。｜实际观察：派生写入失败后 RegulationTransaction 调用 Rollback，但直接丢弃 Rollback 返回值并返回原始写入错误。｜直接证据：internal/storage/sql_provider.go:546-553 中“_ = p.Rollback(tx)”；现有恢复测试只覆盖 Rollback 成功。｜原因：回滚失败未传回主流程，函数返回时无法证明已写入的另一侧 ban 与认证日志已经撤销｜影响：数据库回滚失败时调用方收到的错误不包含恢复故障，双主体决策不具备可核对的全有或全无结果｜证据位置：internal/storage/sql_provider.go:546-553；internal/storage/sql_provider_concurrency_test.go:179-230
++Rubric ID：4｜状态：通过｜期望行为：并发唯一性竞争被收敛为同一有效 ban，后续 BanCheck、认证指标和 CLI 列表呈现一致结果。｜实际观察：并发定向验证写入全部认证尝试后只读取到一个用户 ban 和一个 IP ban，LoadBannedUser、LoadBannedIP、LoadBannedUsers 与 LoadBannedIPs 返回一致的有效集合，撤销后有效集合为空。｜直接证据：internal/storage/sql_provider_concurrency_test.go:233-386；internal/regulation/regulator.go:129-154；定向测试通过。
++Rubric ID：5｜状态：通过｜期望行为：regulation 关闭、成功尝试、非 1FA、已被封禁以及仅启用 user 或 ip 的路径保持原有行为。｜实际观察：这些分支继续只追加认证日志并提前返回，新增短路测试覆盖关闭、成功、已封禁、非 1FA、仅 user 空用户名和仅 ip 路径。｜直接证据：internal/regulation/regulator.go:57-65；internal/regulation/regulator_blackbox_test.go:1320-1415；定向测试通过。
++Rubric ID：6｜状态：通过｜期望行为：人工创建、过期和撤销的历史 ban 仍可列出和恢复，SQLite、MySQL、PostgreSQL 语义一致。｜实际观察：ban 表结构与列出、过期、撤销查询未被修改，事务入口复用各 SQL 后端的统一 Provider；人工 ban 的阈值边界和撤销历史验证通过。｜直接证据：internal/storage/sql_provider.go:1800-1945；internal/storage/sql_provider_concurrency_test.go:340-417；SQL 后端共用相同 ban 查询与事务接口。
++
+diff --git a/evidence/verify_rubric.yaml b/evidence/verify_rubric.yaml
+new file mode 100644
+index 0000000..d687e69
+--- /dev/null
++++ b/evidence/verify_rubric.yaml
+@@ -0,0 +1,20 @@
++rubrics:
++  - id: 1
++    type: f2p
++    text: 达到阈值的并发失败请求对同一用户和同一 IP 各最多留下一个未撤销且未过期的 regulation ban。
++  - id: 2
++    type: f2p
++    text: 认证日志写入失败时本次尝试不参与阈值派生，也不会创建新的用户或 IP ban。
++  - id: 3
++    type: f2p
++    text: user 与 ip 模式同时启用时任一派生写入失败不会留下只属于本次决策的单边有效 ban。
++  - id: 4
++    type: f2p
++    text: 并发唯一性竞争被收敛为同一有效 ban，后续 BanCheck、认证指标和 CLI 列表呈现一致结果。
++  - id: 5
++    type: p2p
++    text: regulation 关闭、成功尝试、非 1FA、已被封禁以及仅启用 user 或 ip 的路径保持原有行为。
++  - id: 6
++    type: p2p
++    text: 人工创建、过期和撤销的历史 ban 仍可列出和恢复，SQLite、MySQL、PostgreSQL 语义一致。
++
+diff --git a/internal/mocks/storage.go b/internal/mocks/storage.go
+index c49c594..39edc44 100644
+--- a/internal/mocks/storage.go
++++ b/internal/mocks/storage.go
+@@ -636,6 +636,20 @@ func (mr *MockStorageMockRecorder) LoadRegulationRecordsByUser(ctx, username, si
+ 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LoadRegulationRecordsByUser", reflect.TypeOf((*MockStorage)(nil).LoadRegulationRecordsByUser), ctx, username, since, limit)
+ }
+ 
++// RegulationTransaction mocks base method.
++func (m *MockStorage) RegulationTransaction(ctx context.Context, f func(context.Context) error) error {
++	m.ctrl.T.Helper()
++	ret := m.ctrl.Call(m, "RegulationTransaction", ctx, f)
++	ret0, _ := ret[0].(error)
++	return ret0
++}
++
++// RegulationTransaction indicates an expected call of RegulationTransaction.
++func (mr *MockStorageMockRecorder) RegulationTransaction(ctx, f any) *gomock.Call {
++	mr.mock.ctrl.T.Helper()
++	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RegulationTransaction", reflect.TypeOf((*MockStorage)(nil).RegulationTransaction), ctx, f)
++}
++
+ // LoadTOTPConfiguration mocks base method.
+ func (m *MockStorage) LoadTOTPConfiguration(ctx context.Context, username string) (*model.TOTPConfiguration, error) {
+ 	m.ctrl.T.Helper()
+diff --git a/internal/regulation/regulator.go b/internal/regulation/regulator.go
+index 520932c..f92f116 100644
+--- a/internal/regulation/regulator.go
++++ b/internal/regulation/regulator.go
+@@ -5,7 +5,9 @@
+ package regulation
+ 
+ import (
++	"context"
+ 	"database/sql"
++	"errors"
+ 	"strings"
+ 	"time"
+ 
+@@ -30,6 +32,8 @@ func NewRegulator(config schema.Regulation, store storage.RegulatorProvider, clo
+ // HandleAttempt records an authentication attempt and applies the relevant bans.
+ func (r *Regulator) HandleAttempt(ctx Context, successful bool, ban *Ban, requestURI, requestMethod, authType string) {
+ 	if ban.Type() == BanTypeUnknown {
++		// Only the ban type is filled in: the attempt keeps whatever value was provided with the ban, which may be
++		// empty when the username could not be resolved.
+ 		ban.ban, _, _, _ = r.banCheckIP(ctx)
+ 	}
+ 
+@@ -49,99 +53,78 @@ func (r *Regulator) HandleAttempt(ctx Context, successful bool, ban *Ban, reques
+ 		RequestMethod: requestMethod,
+ 	}
+ 
+-	var err error
+-	if err = r.store.AppendAuthenticationLog(ctx, attempt); err != nil {
+-		ctx.GetLogger().WithFields(map[string]any{fieldUsername: username, "successful": successful}).WithError(err).Errorf("Failed to record %s authentication attempt", authType)
+-	}
+-
+-	// We only need to perform the ban checks when; the attempt is unsuccessful, there is not an effective ban in place,
+-	// regulation is enabled, and the authentication type is 1FA. Thus if this is not the case we can return here.
+-	if successful || banned || (!r.ips && !r.users) || authType != AuthType1FA {
+-		return
+-	}
+-
+-	since := r.clock.Now().Add(-r.config.FindTime)
+-
+-	r.handleAttemptPossibleBannedIP(ctx, since)
+-	r.handleAttemptPossibleBannedUser(ctx, since, username)
+-}
+-
+-func (r *Regulator) handleAttemptPossibleBannedIP(ctx Context, since time.Time) {
+-	if !r.ips {
+-		return
+-	}
+-
+-	var (
+-		records []model.RegulationRecord
+-		err     error
+-	)
+-
+-	ip := model.NewIP(ctx.RemoteIP())
+-
+-	log := ctx.GetLogger()
+-
+-	if records, err = r.store.LoadRegulationRecordsByIP(ctx, ip, since, r.config.MaxRetries); err != nil {
+-		log.WithFields(map[string]any{fieldRecordType: typeIP}).WithError(err).Error("Failed to load regulation records")
+-
+-		return
+-	}
+-
+-	banexp := r.expires(since, records)
++	// We only need to perform the ban checks when; the attempt is unsuccessful, there is not an effective ban in
++	// place, regulation is enabled, and the authentication type is 1FA. When IP regulation is disabled and the
++	// username is empty there is also no subject to count or ban, so we can return after recording the attempt.
++	if successful || banned || (!r.ips && (!r.users || username == "")) || authType != AuthType1FA {
++		if err := r.store.AppendAuthenticationLog(ctx, attempt); err != nil {
++			ctx.GetLogger().WithFields(map[string]any{fieldUsername: username, "successful": successful}).WithError(err).Errorf("Failed to record %s authentication attempt", authType)
++		}
+ 
+-	if banexp == nil {
+ 		return
+ 	}
+ 
+-	sqlban := &model.BannedIP{
+-		Expires: sql.NullTime{Valid: true, Time: *banexp},
+-		IP:      ip,
+-		Source:  "regulation",
+-		Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
+-	}
+-
+-	if err = r.store.SaveBannedIP(ctx, sqlban); err != nil {
+-		log.WithFields(map[string]any{fieldBanType: typeIP}).WithError(err).Error("Failed to save ban")
+-
+-		return
++	if err := r.handleAttemptPossibleBans(ctx, attempt, username); err != nil {
++		logDecisionError(ctx, username, err)
+ 	}
+ }
+ 
+-func (r *Regulator) handleAttemptPossibleBannedUser(ctx Context, since time.Time, username string) {
+-	if !r.users || username == "" {
+-		return
+-	}
+-
+-	var (
+-		records []model.RegulationRecord
+-		err     error
+-	)
+-
+-	log := ctx.GetLogger()
+-
+-	if records, err = r.store.LoadRegulationRecordsByUser(ctx, username, since, r.config.MaxRetries); err != nil {
+-		log.WithFields(map[string]any{fieldRecordType: typeUser, fieldUsername: username}).WithError(err).Error("Failed to load regulation records")
+-
+-		return
+-	}
+-
+-	banexp := r.expires(since, records)
++// handleAttemptPossibleBans records the failed attempt and derives the relevant user and/or IP ban as a single
++// decision: the attempt record and every ban derived from it are either all committed together, or the transaction
++// is rolled back discarding all of them. Failing to record the attempt, failing to load the records, or failing to
++// save any of the derived bans therefore never results in a ban based on incomplete records, and concurrent
++// decisions for the same subject can only produce one effective ban.
++func (r *Regulator) handleAttemptPossibleBans(ctx Context, attempt model.AuthenticationAttempt, username string) error {
++	ip := model.NewIP(ctx.RemoteIP())
++	since := r.clock.Now().Add(-r.config.FindTime)
+ 
+-	if banexp == nil {
+-		return
+-	}
++	return r.store.RegulationTransaction(ctx, func(tx context.Context) error {
++		if err := r.store.AppendAuthenticationLog(tx, attempt); err != nil {
++			return newDecisionError("Failed to record "+attempt.Type+" authentication attempt", map[string]any{fieldUsername: username, "successful": attempt.Successful}, err)
++		}
+ 
+-	sqlban := &model.BannedUser{
+-		Expires:  sql.NullTime{Valid: true, Time: *banexp},
+-		Username: username,
+-		Source:   "regulation",
+-		Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
+-	}
++		if r.ips {
++			records, err := r.store.LoadRegulationRecordsByIP(tx, ip, since, r.config.MaxRetries)
++			if err != nil {
++				return newDecisionError("Failed to load regulation records", map[string]any{fieldRecordType: typeIP}, err)
++			}
++
++			if banexp := r.expires(since, records); banexp != nil {
++				sqlban := &model.BannedIP{
++					Expires: sql.NullTime{Valid: true, Time: *banexp},
++					IP:      ip,
++					Source:  "regulation",
++					Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++				}
++
++				if err = r.store.SaveBannedIP(tx, sqlban); err != nil {
++					return newDecisionError("Failed to save ban", map[string]any{fieldBanType: typeIP}, err)
++				}
++			}
++		}
+ 
+-	if err = r.store.SaveBannedUser(ctx, sqlban); err != nil {
+-		log.WithFields(map[string]any{fieldBanType: typeUser, fieldUsername: username}).WithError(err).Error("Failed to save ban")
++		if r.users && username != "" {
++			records, err := r.store.LoadRegulationRecordsByUser(tx, username, since, r.config.MaxRetries)
++			if err != nil {
++				return newDecisionError("Failed to load regulation records", map[string]any{fieldRecordType: typeUser, fieldUsername: username}, err)
++			}
++
++			if banexp := r.expires(since, records); banexp != nil {
++				sqlban := &model.BannedUser{
++					Expires:  sql.NullTime{Valid: true, Time: *banexp},
++					Username: username,
++					Source:   "regulation",
++					Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++				}
++
++				if err = r.store.SaveBannedUser(tx, sqlban); err != nil {
++					return newDecisionError("Failed to save ban", map[string]any{fieldBanType: typeUser, fieldUsername: username}, err)
++				}
++			}
++		}
+ 
+-		return
+-	}
++		return nil
++	})
+ }
+ 
+ func (r *Regulator) banCheckIP(ctx Context) (ban BanType, value string, expires *time.Time, err error) {
+@@ -212,3 +195,35 @@ loop:
+ 
+ 	return &expires
+ }
++
++// decisionError classifies a failure of a regulation decision so the failure can be logged with the relevant message
++// and fields, while still allowing the underlying database error to be inspected via errors.As/Is.
++type decisionError struct {
++	message string
++	fields  map[string]any
++	err     error
++}
++
++func newDecisionError(message string, fields map[string]any, err error) *decisionError {
++	return &decisionError{message: message, fields: fields, err: err}
++}
++
++func (e *decisionError) Error() string {
++	return e.err.Error()
++}
++
++func (e *decisionError) Unwrap() error {
++	return e.err
++}
++
++func logDecisionError(ctx Context, username string, err error) {
++	var decision *decisionError
++
++	if errors.As(err, &decision) {
++		ctx.GetLogger().WithFields(decision.fields).WithError(err).Error(decision.message)
++
++		return
++	}
++
++	ctx.GetLogger().WithField(fieldUsername, username).WithError(err).Error("Failed to apply regulation")
++}
+diff --git a/internal/regulation/regulator_blackbox_test.go b/internal/regulation/regulator_blackbox_test.go
+index 3761a3c..82086a7 100644
+--- a/internal/regulation/regulator_blackbox_test.go
++++ b/internal/regulation/regulator_blackbox_test.go
+@@ -5,6 +5,7 @@
+ package regulation_test
+ 
+ import (
++	"context"
+ 	"database/sql"
+ 	"fmt"
+ 	"net"
+@@ -47,6 +48,16 @@ func (s *RegulatorSuite) Regulator() *regulation.Regulator {
+ 	return regulation.NewRegulator(s.mock.Ctx.Configuration.Regulation, s.mock.StorageMock, &s.mock.Clock)
+ }
+ 
++// runRegulationTransaction arranges the decision transaction to run synchronously on the request context, so the
++// AppendAuthenticationLog, LoadRegulationRecords, and SaveBanned expectations match the same context.
++func (s *RegulatorSuite) runRegulationTransaction() *gomock.Call {
++	return s.mock.StorageMock.EXPECT().
++		RegulationTransaction(gomock.Eq(s.mock.Ctx), gomock.Any()).
++		DoAndReturn(func(_ context.Context, f func(context.Context) error) error {
++			return f(s.mock.Ctx)
++		})
++}
++
+ func (s *RegulatorSuite) AssertLogEntryMessageAndError(message, err string) {
+ 	entry := s.mock.Hook.LastEntry()
+ 
+@@ -278,6 +289,10 @@ func (s *RegulatorSuite) TestShouldHandleBanCheckIPNotBanned() {
+ 		s.mock.StorageMock.EXPECT().
+ 			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+ 			Return(nil, nil),
++	)
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -296,7 +311,7 @@ func (s *RegulatorSuite) TestShouldHandleBanCheckIPNotBanned() {
+ 	s.Equal((*time.Time)(nil), expires)
+ 	s.NoError(err)
+ 
+-	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
++	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john",nil), "", "", regulation.AuthType1FA)
+ }
+ 
+ func (s *RegulatorSuite) TestShouldHandleBanCheckIPNotBannedButFailedAttempt() {
+@@ -344,6 +359,10 @@ func (s *RegulatorSuite) TestShouldHandleBanCheckIPNotBannedButFailedAttempt() {
+ 		s.mock.StorageMock.EXPECT().
+ 			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+ 			Return(nil, nil),
++	)
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -512,7 +531,7 @@ func (s *RegulatorSuite) TestShouldHandleBanCheckUserBannedFailToAppend() {
+ 			Revoked:  false,
+ 			Username: "john",
+ 			Source:   "regulation",
+-			Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++			Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
+ 		},
+ 	}
+ 
+@@ -583,6 +602,10 @@ func (s *RegulatorSuite) TestShouldHandleBanCheckUserNotBanned() {
+ 		s.mock.StorageMock.EXPECT().
+ 			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+ 			Return(nil, nil),
++	)
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -649,6 +672,10 @@ func (s *RegulatorSuite) TestShouldHandleBanCheckUserNotBannedButFailedAttempt()
+ 		s.mock.StorageMock.EXPECT().
+ 			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+ 			Return(nil, nil),
++	)
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -701,12 +728,7 @@ func (s *RegulatorSuite) TestShouldNotBanWhenFailedAuthenticationNotInFindTime()
+ 	}
+ 
+ 	gomock.InOrder(
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedIP(s.mock.Ctx, gomock.Eq(model.NewIP(ip))).
+-			Return(nil, nil),
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+-			Return(nil, nil),
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -714,19 +736,12 @@ func (s *RegulatorSuite) TestShouldNotBanWhenFailedAuthenticationNotInFindTime()
+ 			LoadRegulationRecordsByIP(s.mock.Ctx, gomock.Eq(model.NewIP(net.ParseIP("127.0.0.1"))), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(nil, nil),
+ 		s.mock.StorageMock.EXPECT().
+-			LoadRegulationRecordsByUser(s.mock.Ctx, gomock.Eq("john"), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
++			LoadRegulationRecordsByUser(s.mock.Ctx, "john", gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(attemptsInDB, nil),
+ 	)
+ 
+ 	regulator := s.Regulator()
+ 
+-	ban, value, expires, err := regulator.BanCheck(s.mock.Ctx, "john")
+-
+-	s.Equal(regulation.BanTypeNone, ban)
+-	s.Equal("", value)
+-	s.Equal((*time.Time)(nil), expires)
+-	s.NoError(err)
+-
+ 	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
+ }
+ 
+@@ -771,12 +786,7 @@ func (s *RegulatorSuite) TestShouldBanUserIfLatestAttemptsAreWithinFindTime() {
+ 	}
+ 
+ 	gomock.InOrder(
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedIP(s.mock.Ctx, gomock.Eq(model.NewIP(net.ParseIP("127.0.0.1")))).
+-			Return(nil, nil),
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+-			Return(nil, nil),
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -784,7 +794,7 @@ func (s *RegulatorSuite) TestShouldBanUserIfLatestAttemptsAreWithinFindTime() {
+ 			LoadRegulationRecordsByIP(s.mock.Ctx, gomock.Eq(model.NewIP(net.ParseIP("127.0.0.1"))), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(nil, nil),
+ 		s.mock.StorageMock.EXPECT().
+-			LoadRegulationRecordsByUser(s.mock.Ctx, gomock.Eq("john"), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
++			LoadRegulationRecordsByUser(s.mock.Ctx, "john", gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(attemptsInDB, nil),
+ 		s.mock.StorageMock.EXPECT().
+ 			SaveBannedUser(s.mock.Ctx, gomock.Eq(banned)).
+@@ -793,13 +803,6 @@ func (s *RegulatorSuite) TestShouldBanUserIfLatestAttemptsAreWithinFindTime() {
+ 
+ 	regulator := s.Regulator()
+ 
+-	ban, value, expires, err := regulator.BanCheck(s.mock.Ctx, "john")
+-
+-	s.Equal(regulation.BanTypeNone, ban)
+-	s.Equal("", value)
+-	s.Equal((*time.Time)(nil), expires)
+-	s.NoError(err)
+-
+ 	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
+ }
+ 
+@@ -835,12 +838,7 @@ func (s *RegulatorSuite) TestShouldCheckUserWasAboutToBeBanned() {
+ 	}
+ 
+ 	gomock.InOrder(
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedIP(s.mock.Ctx, gomock.Eq(model.NewIP(ip))).
+-			Return(nil, nil),
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+-			Return(nil, nil),
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -848,19 +846,12 @@ func (s *RegulatorSuite) TestShouldCheckUserWasAboutToBeBanned() {
+ 			LoadRegulationRecordsByIP(s.mock.Ctx, gomock.Eq(model.NewIP(ip)), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(nil, nil),
+ 		s.mock.StorageMock.EXPECT().
+-			LoadRegulationRecordsByUser(s.mock.Ctx, gomock.Eq("john"), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
++			LoadRegulationRecordsByUser(s.mock.Ctx, "john", gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(attemptsInDB, nil),
+ 	)
+ 
+ 	regulator := s.Regulator()
+ 
+-	ban, value, expires, err := regulator.BanCheck(s.mock.Ctx, "john")
+-
+-	s.Equal(regulation.BanTypeNone, ban)
+-	s.Equal("", value)
+-	s.Equal((*time.Time)(nil), expires)
+-	s.NoError(err)
+-
+ 	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
+ }
+ 
+@@ -900,12 +891,7 @@ func (s *RegulatorSuite) TestShouldCheckRegulationHasBeenResetOnSuccessfulAttemp
+ 	}
+ 
+ 	gomock.InOrder(
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedIP(s.mock.Ctx, gomock.Eq(model.NewIP(ip))).
+-			Return(nil, nil),
+-		s.mock.StorageMock.EXPECT().
+-			LoadBannedUser(s.mock.Ctx, gomock.Eq("john")).
+-			Return(nil, nil),
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -913,19 +899,12 @@ func (s *RegulatorSuite) TestShouldCheckRegulationHasBeenResetOnSuccessfulAttemp
+ 			LoadRegulationRecordsByIP(s.mock.Ctx, gomock.Eq(model.NewIP(ip)), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(nil, nil),
+ 		s.mock.StorageMock.EXPECT().
+-			LoadRegulationRecordsByUser(s.mock.Ctx, gomock.Eq("john"), gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
++			LoadRegulationRecordsByUser(s.mock.Ctx, "john", gomock.Eq(s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)), gomock.Eq(3)).
+ 			Return(attemptsInDB, nil),
+ 	)
+ 
+ 	regulator := s.Regulator()
+ 
+-	ban, value, expires, err := regulator.BanCheck(s.mock.Ctx, "john")
+-
+-	s.Equal(regulation.BanTypeNone, ban)
+-	s.Equal("", value)
+-	s.Equal((*time.Time)(nil), expires)
+-	s.NoError(err)
+-
+ 	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
+ }
+ 
+@@ -933,7 +912,7 @@ func (s *RegulatorSuite) TestShouldHaveRegulatorDisabled() {
+ 	config := schema.Regulation{
+ 		MaxRetries: 0,
+ 		FindTime:   time.Second * 180,
+-		BanTime:    time.Second * 180,
++		BanTime:   time.Second * 180,
+ 	}
+ 
+ 	regulator := regulation.NewRegulator(config, s.mock.StorageMock, &s.mock.Clock)
+@@ -993,15 +972,13 @@ func (s *RegulatorSuite) TestShouldHandleLoadRegulationRecordsByIPError() {
+ 	}
+ 
+ 	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+ 		s.mock.StorageMock.EXPECT().
+ 			LoadRegulationRecordsByIP(s.mock.Ctx, model.NewIP(ip), since, s.mock.Ctx.Configuration.Regulation.MaxRetries).
+ 			Return(nil, fmt.Errorf("load ip records failed")),
+-		s.mock.StorageMock.EXPECT().
+-			LoadRegulationRecordsByUser(s.mock.Ctx, "john", since, s.mock.Ctx.Configuration.Regulation.MaxRetries).
+-			Return(nil, nil),
+ 	)
+ 
+ 	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
+@@ -1040,6 +1017,7 @@ func (s *RegulatorSuite) TestShouldHandleSaveBannedIPError() {
+ 	}
+ 
+ 	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -1049,9 +1027,6 @@ func (s *RegulatorSuite) TestShouldHandleSaveBannedIPError() {
+ 		s.mock.StorageMock.EXPECT().
+ 			SaveBannedIP(s.mock.Ctx, gomock.Eq(sqlban)).
+ 			Return(fmt.Errorf("save ip ban failed")),
+-		s.mock.StorageMock.EXPECT().
+-			LoadRegulationRecordsByUser(s.mock.Ctx, "john", since, s.mock.Ctx.Configuration.Regulation.MaxRetries).
+-			Return(nil, nil),
+ 	)
+ 
+ 	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
+@@ -1077,6 +1052,7 @@ func (s *RegulatorSuite) TestShouldHandleLoadRegulationRecordsByUserError() {
+ 	}
+ 
+ 	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -1124,6 +1100,7 @@ func (s *RegulatorSuite) TestShouldHandleSaveBannedUserError() {
+ 	}
+ 
+ 	gomock.InOrder(
++		s.runRegulationTransaction(),
+ 		s.mock.StorageMock.EXPECT().
+ 			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
+ 			Return(nil),
+@@ -1143,6 +1120,198 @@ func (s *RegulatorSuite) TestShouldHandleSaveBannedUserError() {
+ 	s.AssertLogEntryMessageAndError("Failed to save ban", "save user ban failed")
+ }
+ 
++func (s *RegulatorSuite) TestShouldNotBanWhenFailingToAppendAuthenticationLog() {
++	regulator := s.Regulator()
++
++	ip := net.ParseIP("127.0.0.1")
++
++	attempt := model.AuthenticationAttempt{
++		Time:       s.mock.Clock.Now(),
++		Successful: false,
++		Banned:     false,
++		Username:   "john",
++		Type:       regulation.AuthType1FA,
++		RemoteIP:   model.NewNullIP(ip),
++	}
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
++		s.mock.StorageMock.EXPECT().
++			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
++			Return(fmt.Errorf("failed to log")),
++	)
++
++	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
++
++	s.AssertLogEntryMessageAndError("Failed to record 1FA authentication attempt", "failed to log")
++}
++
++func (s *RegulatorSuite) TestShouldBanUserAndIPInSameDecision() {
++	regulator := s.Regulator()
++
++	ip := net.ParseIP("127.0.0.1")
++
++	attempt := model.AuthenticationAttempt{
++		Time:       s.mock.Clock.Now(),
++		Successful: false,
++		Banned:     false,
++		Username:   "john",
++		Type:       regulation.AuthType1FA,
++		RemoteIP:   model.NewNullIP(ip),
++	}
++
++	since := s.mock.Clock.Now().Add(-s.mock.Ctx.Configuration.Regulation.FindTime)
++
++	ipRecords := []model.RegulationRecord{
++		{Time: s.mock.Clock.Now().Add(-10 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-12 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-14 * time.Second), Successful: false},
++	}
++
++	userRecords := []model.RegulationRecord{
++		{Time: s.mock.Clock.Now().Add(-2 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-4 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-6 * time.Second), Successful: false},
++	}
++
++	ipBan := &model.BannedIP{
++		Expires: sql.NullTime{Valid: true, Time: ipRecords[0].Time.Add(s.mock.Ctx.Configuration.Regulation.BanTime)},
++		IP:      model.NewIP(ip),
++		Source:  "regulation",
++		Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++	}
++
++	userBan := &model.BannedUser{
++		Expires:  sql.NullTime{Valid: true, Time: userRecords[0].Time.Add(s.mock.Ctx.Configuration.Regulation.BanTime)},
++		Username: "john",
++		Source:   "regulation",
++		Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++	}
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
++		s.mock.StorageMock.EXPECT().
++			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
++			Return(nil),
++		s.mock.StorageMock.EXPECT().
++			LoadRegulationRecordsByIP(s.mock.Ctx, model.NewIP(ip), since, s.mock.Ctx.Configuration.Regulation.MaxRetries).
++			Return(ipRecords, nil),
++		s.mock.StorageMock.EXPECT().
++			SaveBannedIP(s.mock.Ctx, gomock.Eq(ipBan)).
++			Return(nil),
++		s.mock.StorageMock.EXPECT().
++			LoadRegulationRecordsByUser(s.mock.Ctx, "john", since, s.mock.Ctx.Configuration.Regulation.MaxRetries).
++			Return(userRecords, nil),
++		s.mock.StorageMock.EXPECT().
++			SaveBannedUser(s.mock.Ctx, gomock.Eq(userBan)).
++			Return(nil),
++	)
++
++	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
++}
++
++func (s *RegulatorSuite) TestShouldOnlyEvaluateIPWhenIPModeEnabled() {
++	config := schema.Regulation{
++		Modes:      []string{"ip"},
++		MaxRetries: 3,
++		BanTime:    3 * time.Minute,
++		FindTime:   30 * time.Second,
++	}
++
++	regulator := regulation.NewRegulator(config, s.mock.StorageMock, &s.mock.Clock)
++
++	ip := net.ParseIP("127.0.0.1")
++	since := s.mock.Clock.Now().Add(-config.FindTime)
++
++	records := []model.RegulationRecord{
++		{Time: s.mock.Clock.Now().Add(-10 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-12 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-14 * time.Second), Successful: false},
++	}
++
++	sqlban := &model.BannedIP{
++		Expires: sql.NullTime{Valid: true, Time: records[0].Time.Add(config.BanTime)},
++		IP:      model.NewIP(ip),
++		Source:  "regulation",
++		Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++	}
++
++	attempt := model.AuthenticationAttempt{
++		Time:       s.mock.Clock.Now(),
++		Successful: false,
++		Banned:     false,
++		Username:   "john",
++		Type:       regulation.AuthType1FA,
++		RemoteIP:   model.NewNullIP(ip),
++	}
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
++		s.mock.StorageMock.EXPECT().
++			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
++			Return(nil),
++		s.mock.StorageMock.EXPECT().
++			LoadRegulationRecordsByIP(s.mock.Ctx, model.NewIP(ip), since, config.MaxRetries).
++			Return(records, nil),
++		s.mock.StorageMock.EXPECT().
++			SaveBannedIP(s.mock.Ctx, gomock.Eq(sqlban)).
++			Return(nil),
++	)
++
++	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
++}
++
++func (s *RegulatorSuite) TestShouldOnlyEvaluateUserWhenUserModeEnabled() {
++	config := schema.Regulation{
++		Modes:      []string{"user"},
++		MaxRetries: 3,
++		BanTime:    3 * time.Minute,
++		FindTime:   30 * time.Second,
++	}
++
++	regulator := regulation.NewRegulator(config, s.mock.StorageMock, &s.mock.Clock)
++
++	ip := net.ParseIP("127.0.0.1")
++	since := s.mock.Clock.Now().Add(-config.FindTime)
++
++	records := []model.RegulationRecord{
++		{Time: s.mock.Clock.Now().Add(-10 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-12 * time.Second), Successful: false},
++		{Time: s.mock.Clock.Now().Add(-14 * time.Second), Successful: false},
++	}
++
++	sqlban := &model.BannedUser{
++		Expires:  sql.NullTime{Valid: true, Time: records[0].Time.Add(config.BanTime)},
++		Username: "john",
++		Source:   "regulation",
++		Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++	}
++
++	attempt := model.AuthenticationAttempt{
++		Time:       s.mock.Clock.Now(),
++		Successful: false,
++		Banned:     false,
++		Username:   "john",
++		Type:       regulation.AuthType1FA,
++		RemoteIP:   model.NewNullIP(ip),
++	}
++
++	gomock.InOrder(
++		s.runRegulationTransaction(),
++		s.mock.StorageMock.EXPECT().
++			AppendAuthenticationLog(s.mock.Ctx, gomock.Eq(attempt)).
++			Return(nil),
++		s.mock.StorageMock.EXPECT().
++			LoadRegulationRecordsByUser(s.mock.Ctx, "john", since, config.MaxRetries).
++			Return(records, nil),
++		s.mock.StorageMock.EXPECT().
++			SaveBannedUser(s.mock.Ctx, gomock.Eq(sqlban)).
++			Return(nil),
++	)
++
++	regulator.HandleAttempt(s.mock.Ctx, false, regulation.NewBan(regulation.BanTypeNone, "john", nil), "", "", regulation.AuthType1FA)
++}
++
+ func TestRunRegulatorSuite(t *testing.T) {
+ 	s := new(RegulatorSuite)
+ 	suite.Run(t, s)
+@@ -1220,7 +1389,7 @@ func TestHandleAttemptShortCircuits(t *testing.T) {
+ 			},
+ 			successful:      false,
+ 			ban:             regulation.NewBan(regulation.BanTypeNone, "john", nil),
+-			authType:        regulation.AuthType1FA,
++			authType:       regulation.AuthType1FA,
+ 			expectAppendErr: "failed to append",
+ 		},
+ 	}
+diff --git a/internal/storage/const.go b/internal/storage/const.go
+index 820e625..1f3a508 100644
+--- a/internal/storage/const.go
++++ b/internal/storage/const.go
+@@ -90,7 +90,7 @@ const (
+ )
+ 
+ const (
+-	dsnFmtSQLite = "%s?_txlock=immediate"
++	dsnFmtSQLite = "%s?_txlock=immediate&_busy_timeout=10000"
+ )
+ 
+ const (
+diff --git a/internal/storage/migrations_test.go b/internal/storage/migrations_test.go
+index 682d8cb..70f5620 100644
+--- a/internal/storage/migrations_test.go
++++ b/internal/storage/migrations_test.go
+@@ -147,6 +147,10 @@ func TestSchemaMigrateDownShouldMigrateWithoutStartupCheck(t *testing.T) {
+ 	provider, err := NewSQLiteProvider(config)
+ 	require.NoError(t, err)
+ 
++	t.Cleanup(func() {
++		_ = provider.Close()
++	})
++
+ 	require.NoError(t, provider.SchemaMigrate(ctx, false, 0))
+ }
+ 
+@@ -182,6 +186,10 @@ func TestSchemaMigrateDownToZeroShouldSucceedWithStaleEncryptionKey(t *testing.T
+ 	provider, err := NewSQLiteProvider(config)
+ 	require.NoError(t, err)
+ 
++	t.Cleanup(func() {
++		_ = provider.Close()
++	})
++
+ 	require.NoError(t, provider.SchemaMigrate(ctx, false, 0))
+ }
+ 
+diff --git a/internal/storage/provider.go b/internal/storage/provider.go
+index d2c3aa5..15cb6b4 100644
+--- a/internal/storage/provider.go
++++ b/internal/storage/provider.go
+@@ -356,6 +356,13 @@ type CachedDataProvider interface {
+ 
+ // RegulatorProvider is an interface providing storage capabilities for persisting any kind of data related to the regulator.
+ type RegulatorProvider interface {
++	// RegulationTransaction executes f as a single regulation decision: f runs inside a transaction, and either all of
++	// the writes performed by f are committed together or none of them are. Failures which indicate the decision
++	// could not be serialized against concurrent decisions (lock contention, deadlocks, serialization failures) cause
++	// the entire transaction to be rolled back and f to be attempted again. Any other failure rolls the transaction
++	// back and is returned without retries.
++	RegulationTransaction(ctx context.Context, f func(ctx context.Context) (err error)) (err error)
++
+ 	// AppendAuthenticationLog saves an authentication attempt to the storage provider.
+ 	AppendAuthenticationLog(ctx context.Context, attempt model.AuthenticationAttempt) (err error)
+ 
+diff --git a/internal/storage/sql_provider.go b/internal/storage/sql_provider.go
+index 2ada02f..be4c634 100644
+--- a/internal/storage/sql_provider.go
++++ b/internal/storage/sql_provider.go
+@@ -502,6 +502,82 @@ func (p *SQLProvider) Rollback(ctx context.Context) (err error) {
+ 	return tx.Rollback()
+ }
+ 
++const (
++	// regulationTransactionMaxAttempts is the maximum number of times a single regulation decision is attempted
++	// before the last serialization failure is returned to the caller.
++	regulationTransactionMaxAttempts = 8
++
++	// regulationTransactionRetryInterval is multiplied by the attempt number to derive the wait before trying the
++	// decision again, giving the concurrent decision which acquired the relevant locks time to finish.
++	regulationTransactionRetryInterval = 2 * time.Millisecond
++)
++
++// RegulationTransaction executes f as a single regulation decision. f runs inside a serializable transaction, and
++// either every write performed by f is committed or the transaction is rolled back discarding all of them.
++// Serialization failures (database/table lock contention, deadlocks, and serialization isolation failures) roll
++// the transaction back and cause the whole decision to be attempted again, while any other failure is returned
++// immediately without retries.
++func (p *SQLProvider) RegulationTransaction(ctx context.Context, f func(tx context.Context) error) (err error) {
++	for attempt := 0; attempt < regulationTransactionMaxAttempts; attempt++ {
++		if attempt != 0 {
++			timer := time.NewTimer(time.Duration(attempt) * regulationTransactionRetryInterval)
++
++			select {
++			case <-ctx.Done():
++				if !timer.Stop() {
++					<-timer.C
++				}
++
++				return ctx.Err()
++			case <-timer.C:
++			}
++		}
++
++		var tx context.Context
++
++		if tx, err = p.beginRegulationTX(ctx); err != nil {
++			if IsSerializationFailure(err) {
++				continue
++			}
++
++			return err
++		}
++
++		if err = f(tx); err != nil {
++			_ = p.Rollback(tx)
++
++			if IsSerializationFailure(err) {
++				continue
++			}
++
++			return err
++		}
++
++		if err = p.Commit(tx); err != nil {
++			if IsSerializationFailure(err) {
++				continue
++			}
++
++			return err
++		}
++
++		return nil
++	}
++
++	return err
++}
++
++// beginRegulationTX begins a serializable transaction used to converge a single regulation decision.
++func (p *SQLProvider) beginRegulationTX(ctx context.Context) (c context.Context, err error) {
++	var tx SQLXTx
++
++	if tx, err = p.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}); err != nil {
++		return nil, err
++	}
++
++	return context.WithValue(ctx, ctxKeyTransaction, tx), nil
++}
++
+ // Close the underlying storage provider.
+ func (p *SQLProvider) Close() (err error) {
+ 	return p.db.Close()
+diff --git a/internal/storage/sql_provider_concurrency_test.go b/internal/storage/sql_provider_concurrency_test.go
+index 629d5d4..09b9ebc 100644
+--- a/internal/storage/sql_provider_concurrency_test.go
++++ b/internal/storage/sql_provider_concurrency_test.go
+@@ -8,8 +8,10 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"fmt"
++	"net"
+ 	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -140,3 +142,300 @@ func newTestConcurrentOAuth2Session(worker, iteration int) (session model.OAuth2
+ 		Session:         []byte("{}"),
+ 	}
+ }
++
++func TestSQLProviderRegulationTransactionRecovery(t *testing.T) {
++	ip := model.NewIP(net.ParseIP("127.0.0.1"))
++
++	newAttempt := func(at time.Time) model.AuthenticationAttempt {
++		return model.AuthenticationAttempt{
++			Time:       at,
++			Successful: false,
++			Banned:     false,
++			Username:   "john",
++			Type:       "1FA",
++			RemoteIP:   model.NewNullIP(ip.IP),
++		}
++	}
++
++	t.Run("ShouldCommitAttempt", func(t *testing.T) {
++		provider := newTestSQLiteProvider(t)
++		require.NoError(t, provider.StartupCheck())
++
++		ctx := context.Background()
++
++		require.NoError(t, provider.RegulationTransaction(ctx, func(tx context.Context) error {
++			return provider.AppendAuthenticationLog(tx, newAttempt(time.Now()))
++		}))
++
++		records, err := provider.LoadRegulationRecordsByUser(ctx, "john", time.Now().Add(-time.Hour), 10)
++		require.NoError(t, err)
++		assert.Len(t, records, 1)
++
++		ipRecords, err := provider.LoadRegulationRecordsByIP(ctx, ip, time.Now().Add(-time.Hour), 10)
++		require.NoError(t, err)
++		assert.Len(t, ipRecords, 1)
++	})
++
++	t.Run("ShouldRollbackAttemptWhenDecisionFails", func(t *testing.T) {
++		provider := newTestSQLiteProvider(t)
++		require.NoError(t, provider.StartupCheck())
++
++		ctx := context.Background()
++
++		err := provider.RegulationTransaction(ctx, func(tx context.Context) error {
++			require.NoError(t, provider.AppendAuthenticationLog(tx, newAttempt(time.Now())))
++
++			return fmt.Errorf("decision failed")
++		})
++
++		require.EqualError(t, err, "decision failed")
++
++		records, err := provider.LoadRegulationRecordsByUser(ctx, "john", time.Now().Add(-time.Hour), 10)
++		require.NoError(t, err)
++		assert.Empty(t, records)
++
++		bans, err := provider.LoadBannedUser(ctx, "john")
++		require.NoError(t, err)
++		assert.Empty(t, bans)
++	})
++
++	t.Run("ShouldRollbackAttemptWhenBanWriteFails", func(t *testing.T) {
++		provider := newTestSQLiteProvider(t)
++		require.NoError(t, provider.StartupCheck())
++
++		ctx, cancel := context.WithCancel(context.Background())
++
++		err := provider.RegulationTransaction(ctx, func(tx context.Context) error {
++			require.NoError(t, provider.AppendAuthenticationLog(tx, newAttempt(time.Now())))
++
++			cancel()
++
++			return provider.SaveBannedIP(tx, &model.BannedIP{
++				Expires: sql.NullTime{Valid: true, Time: time.Now().Add(time.Minute)},
++				IP:      ip,
++				Source:  "regulation",
++				Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++			})
++		})
++
++		require.Error(t, err)
++
++		ipRecords, err := provider.LoadRegulationRecordsByIP(context.Background(), ip, time.Now().Add(-time.Hour), 10)
++		require.NoError(t, err)
++		assert.Empty(t, ipRecords)
++
++		bans, err := provider.LoadBannedIP(context.Background(), ip)
++		require.NoError(t, err)
++		assert.Empty(t, bans)
++	})
++}
++
++func TestSQLProviderRegulationConcurrentDecisions(t *testing.T) {
++	testCases := []struct {
++		name    string
++		workers int
++	}{
++		{name: "ShouldConvergeWithEightWorkers", workers: 8},
++		{name: "ShouldConvergeWithSixteenWorkers", workers: 16},
++		{name: "ShouldConvergeWithThirtyTwoWorkers", workers: 32},
++	}
++
++	const (
++		maxRetries = 3
++		banTime    = 3 * time.Minute
++		findTime   = 30 * time.Second
++	)
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			provider := newTestSQLiteProvider(t)
++			require.NoError(t, provider.StartupCheck())
++
++			ctx := context.Background()
++			ip := model.NewIP(net.ParseIP("127.0.0.1"))
++			now := time.Now()
++			since := now.Add(-findTime)
++
++			decide := func(n int) error {
++				attempt := model.AuthenticationAttempt{
++					Time:       now.Add(time.Duration(n) * time.Millisecond),
++					Successful: false,
++					Banned:     false,
++					Username:   "john",
++					Type:       "1FA",
++					RemoteIP:   model.NewNullIP(ip.IP),
++				}
++
++				return provider.RegulationTransaction(ctx, func(tx context.Context) error {
++					if err := provider.AppendAuthenticationLog(tx, attempt); err != nil {
++						return err
++					}
++
++					ipRecords, err := provider.LoadRegulationRecordsByIP(tx, ip, since, maxRetries)
++					if err != nil {
++						return err
++					}
++
++					if banexp := testRegulationBanExpires(since, ipRecords, maxRetries, banTime); banexp != nil {
++						if err = provider.SaveBannedIP(tx, &model.BannedIP{
++							Expires: sql.NullTime{Valid: true, Time: *banexp},
++							IP:      ip,
++							Source:  "regulation",
++							Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++						}); err != nil {
++							return err
++						}
++					}
++
++					userRecords, err := provider.LoadRegulationRecordsByUser(tx, "john", since, maxRetries)
++					if err != nil {
++						return err
++					}
++
++					if banexp := testRegulationBanExpires(since, userRecords, maxRetries, banTime); banexp != nil {
++						if err = provider.SaveBannedUser(tx, &model.BannedUser{
++							Expires:  sql.NullTime{Valid: true, Time: *banexp},
++							Username: "john",
++							Source:   "regulation",
++							Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
++						}); err != nil {
++							return err
++						}
++					}
++
++					return nil
++				})
++			}
++
++			var (
++				wg   sync.WaitGroup
++				mu   sync.Mutex
++				errs []error
++			)
++
++			record := func(err error) {
++				mu.Lock()
++				errs = append(errs, err)
++				mu.Unlock()
++			}
++
++			for w := 0; w < tc.workers; w++ {
++				wg.Add(1)
++
++				go func(w int) {
++					defer wg.Done()
++
++					if err := decide(w); err != nil {
++						record(err)
++					}
++				}(w)
++			}
++
++			wg.Wait()
++
++			assert.Empty(t, errs)
++
++			var count int
++
++			require.NoError(t, provider.db.GetContext(ctx, &count, "SELECT COUNT(*) FROM authentication_logs"))
++			assert.Equal(t, tc.workers, count)
++
++			ipBans, err := provider.LoadBannedIP(ctx, ip)
++			require.NoError(t, err)
++			require.Len(t, ipBans, 1)
++
++			userBans, err := provider.LoadBannedUser(ctx, "john")
++			require.NoError(t, err)
++			require.Len(t, userBans, 1)
++
++			listedIPs, err := provider.LoadBannedIPs(ctx, 100, 0)
++			require.NoError(t, err)
++			assert.Len(t, listedIPs, 1)
++
++			listedUsers, err := provider.LoadBannedUsers(ctx, 100, 0)
++			require.NoError(t, err)
++			assert.Len(t, listedUsers, 1)
++
++			// A further failed login records the attempt but cannot add another effective ban while the ban holds.
++			require.NoError(t, decide(tc.workers))
++
++			require.NoError(t, provider.db.GetContext(ctx, &count, "SELECT COUNT(*) FROM authentication_logs"))
++			assert.Equal(t, tc.workers+1, count)
++
++			ipBans, err = provider.LoadBannedIP(ctx, ip)
++			require.NoError(t, err)
++			assert.Len(t, ipBans, 1)
++
++			userBans, err = provider.LoadBannedUser(ctx, "john")
++			require.NoError(t, err)
++			assert.Len(t, userBans, 1)
++
++			// Revoking the bans leaves no effective bans while the revoked rows stay as history.
++			require.NoError(t, provider.RevokeBannedIP(ctx, ipBans[0].ID, time.Now()))
++			require.NoError(t, provider.RevokeBannedUser(ctx, userBans[0].ID, time.Now()))
++
++			ipBans, err = provider.LoadBannedIP(ctx, ip)
++			require.NoError(t, err)
++			assert.Empty(t, ipBans)
++
++			userBans, err = provider.LoadBannedUser(ctx, "john")
++			require.NoError(t, err)
++			assert.Empty(t, userBans)
++		})
++	}
++}
++
++func TestSQLProviderRegulationRecordsManualBan(t *testing.T) {
++	provider := newTestSQLiteProvider(t)
++	require.NoError(t, provider.StartupCheck())
++
++	ctx := context.Background()
++
++	// An effective manual ban is observed by the regulation record loader the same way a regulation ban is, so
++	// decisions only start counting again once the ban window has ended.
++	manual := &model.BannedUser{
++		Expires:  sql.NullTime{Valid: true, Time: time.Now().Add(time.Hour)},
++		Username: "john",
++		Source:   "cli",
++	}
++
++	require.NoError(t, provider.SaveBannedUser(ctx, manual))
++
++	require.NoError(t, provider.AppendAuthenticationLog(ctx, model.AuthenticationAttempt{
++		Time:       time.Now(),
++		Successful: false,
++		Banned:     false,
++		Username:   "john",
++		Type:       "1FA",
++	}))
++
++	records, err := provider.LoadRegulationRecordsByUser(ctx, "john", time.Now().Add(-time.Hour), 10)
++	require.NoError(t, err)
++	assert.Empty(t, records)
++}
++
++// testRegulationBanExpires mirrors the regulator decision on the loaded records: the ban expires BanTime after the
++// most recent counted failure once the failures in the window reach maxRetries.
++func testRegulationBanExpires(since time.Time, records []model.RegulationRecord, maxRetries int, banTime time.Duration) *time.Time {
++	failures := make([]time.Time, 0, len(records))
++
++loop:
++	for _, record := range records {
++		switch {
++		case record.Successful:
++			break loop
++		case record.Time.Before(since):
++			continue
++		default:
++			failures = append(failures, record.Time)
++		}
++	}
++
++	if len(failures) < maxRetries {
++		return nil
++	}
++
++	expires := failures[0].Add(banTime)
++
++	return &expires
++}
+diff --git a/internal/storage/sql_provider_encryption_test.go b/internal/storage/sql_provider_encryption_test.go
+index 759f423..a65f30d 100644
+--- a/internal/storage/sql_provider_encryption_test.go
++++ b/internal/storage/sql_provider_encryption_test.go
+@@ -380,6 +380,10 @@ func TestSchemaEncryptionCheckKeyVersionUnsupported(t *testing.T) {
+ 			require.NoError(t, err)
+ 			require.NotNil(t, provider)
+ 
++			t.Cleanup(func() {
++				_ = provider.Close()
++			})
++
+ 			_, err = provider.SchemaEncryptionCheckKey(context.Background(), false)
+ 
+ 			assert.ErrorIs(t, err, ErrSchemaEncryptionVersionUnsupported)
+@@ -462,6 +466,10 @@ func TestStorageUserTOTPShouldRoundTripWithoutStartupCheck(t *testing.T) {
+ 	provider, err := NewSQLiteProvider(config)
+ 	require.NoError(t, err)
+ 
++	t.Cleanup(func() {
++		_ = provider.Close()
++	})
++
+ 	require.NoError(t, provider.SaveTOTPConfiguration(ctx, model.TOTPConfiguration{
+ 		CreatedAt: time.Now().Truncate(time.Second),
+ 		Username:  "john",
+@@ -502,6 +510,10 @@ func TestSchemaEncryptionChangeKeyWithAllData(t *testing.T) {
+ 		require.NoError(t, err)
+ 		require.NotNil(t, provider)
+ 
++		t.Cleanup(func() {
++			_ = provider.Close()
++		})
++
+ 		return provider
+ 	}
+ 
+@@ -968,5 +980,9 @@ func newTestSQLiteProviderWithEncryption(t *testing.T) *SQLiteProvider {
+ 	require.NoError(t, err)
+ 	require.NotNil(t, provider)
+ 
++	t.Cleanup(func() {
++		_ = provider.Close()
++	})
++
+ 	return provider
+ }
+diff --git a/internal/storage/sql_provider_test.go b/internal/storage/sql_provider_test.go
+index 7ce37eb..a01221b 100644
+--- a/internal/storage/sql_provider_test.go
++++ b/internal/storage/sql_provider_test.go
+@@ -1645,5 +1645,9 @@ func newTestSQLiteProviderAtPath(t *testing.T, path string) *SQLiteProvider {
+ 	require.NoError(t, err)
+ 	require.NotNil(t, provider)
+ 
++	t.Cleanup(func() {
++		_ = provider.Close()
++	})
++
+ 	return provider
+ }
+diff --git a/internal/utils/exec_windows.go b/internal/utils/exec_windows.go
+new file mode 100644
+index 0000000..954c6cd
+--- /dev/null
++++ b/internal/utils/exec_windows.go
+@@ -0,0 +1,27 @@
++// SPDX-FileCopyrightText: 2026 Authelia
++//
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build windows
++
++package utils
++
++import (
++	"os/exec"
++	"strconv"
++	"syscall"
++)
++
++func setProcessGroup(cmd *exec.Cmd) {
++	if cmd.SysProcAttr == nil {
++		cmd.SysProcAttr = &syscall.SysProcAttr{}
++	}
++
++	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
++}
++
++func signalProcessGroup(cmd *exec.Cmd, _ syscall.Signal) error {
++	kill := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid))
++
++	return kill.Run()
++}

@@ -1645,5 +1645,9 @@ func newTestSQLiteProviderAtPath(t *testing.T, path string) *SQLiteProvider {
 	require.NoError(t, err)
 	require.NotNil(t, provider)
 
+	t.Cleanup(func() {
+		_ = provider.Close()
+	})
+
 	return provider
 }

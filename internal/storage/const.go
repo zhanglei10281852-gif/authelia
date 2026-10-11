@@ -90,7 +90,7 @@ const (
 )
 
 const (
-	dsnFmtSQLite = "%s?_txlock=immediate"
+	dsnFmtSQLite = "%s?_txlock=immediate&_busy_timeout=10000"
 )
 
 const (

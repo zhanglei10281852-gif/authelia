@@ -1,0 +1,20 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 达到阈值的并发失败请求对同一用户和同一 IP 各最多留下一个未撤销且未过期的 regulation ban。
+  - id: 2
+    type: f2p
+    text: 认证日志写入失败时本次尝试不参与阈值派生，也不会创建新的用户或 IP ban。
+  - id: 3
+    type: f2p
+    text: user 与 ip 模式同时启用时任一派生写入失败不会留下只属于本次决策的单边有效 ban。
+  - id: 4
+    type: f2p
+    text: 并发唯一性竞争被收敛为同一有效 ban，后续 BanCheck、认证指标和 CLI 列表呈现一致结果。
+  - id: 5
+    type: p2p
+    text: regulation 关闭、成功尝试、非 1FA、已被封禁以及仅启用 user 或 ip 的路径保持原有行为。
+  - id: 6
+    type: p2p
+    text: 人工创建、过期和撤销的历史 ban 仍可列出和恢复，SQLite、MySQL、PostgreSQL 语义一致。
+

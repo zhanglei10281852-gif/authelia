@@ -380,6 +380,10 @@ func TestSchemaEncryptionCheckKeyVersionUnsupported(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, provider)
 
+			t.Cleanup(func() {
+				_ = provider.Close()
+			})
+
 			_, err = provider.SchemaEncryptionCheckKey(context.Background(), false)
 
 			assert.ErrorIs(t, err, ErrSchemaEncryptionVersionUnsupported)
@@ -462,6 +466,10 @@ func TestStorageUserTOTPShouldRoundTripWithoutStartupCheck(t *testing.T) {
 	provider, err := NewSQLiteProvider(config)
 	require.NoError(t, err)
 
+	t.Cleanup(func() {
+		_ = provider.Close()
+	})
+
 	require.NoError(t, provider.SaveTOTPConfiguration(ctx, model.TOTPConfiguration{
 		CreatedAt: time.Now().Truncate(time.Second),
 		Username:  "john",
@@ -501,6 +509,10 @@ func TestSchemaEncryptionChangeKeyWithAllData(t *testing.T) {
 		provider, err := NewSQLiteProvider(config)
 		require.NoError(t, err)
 		require.NotNil(t, provider)
+
+		t.Cleanup(func() {
+			_ = provider.Close()
+		})
 
 		return provider
 	}
@@ -967,6 +979,10 @@ func newTestSQLiteProviderWithEncryption(t *testing.T) *SQLiteProvider {
 
 	require.NoError(t, err)
 	require.NotNil(t, provider)
+
+	t.Cleanup(func() {
+		_ = provider.Close()
+	})
 
 	return provider
 }

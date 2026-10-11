@@ -356,6 +356,13 @@ type CachedDataProvider interface {
 
 // RegulatorProvider is an interface providing storage capabilities for persisting any kind of data related to the regulator.
 type RegulatorProvider interface {
+	// RegulationTransaction executes f as a single regulation decision: f runs inside a transaction, and either all of
+	// the writes performed by f are committed together or none of them are. Failures which indicate the decision
+	// could not be serialized against concurrent decisions (lock contention, deadlocks, serialization failures) cause
+	// the entire transaction to be rolled back and f to be attempted again. Any other failure rolls the transaction
+	// back and is returned without retries.
+	RegulationTransaction(ctx context.Context, f func(ctx context.Context) (err error)) (err error)
+
 	// AppendAuthenticationLog saves an authentication attempt to the storage provider.
 	AppendAuthenticationLog(ctx context.Context, attempt model.AuthenticationAttempt) (err error)
 

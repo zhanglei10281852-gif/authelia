@@ -502,6 +502,82 @@ func (p *SQLProvider) Rollback(ctx context.Context) (err error) {
 	return tx.Rollback()
 }
 
+const (
+	// regulationTransactionMaxAttempts is the maximum number of times a single regulation decision is attempted
+	// before the last serialization failure is returned to the caller.
+	regulationTransactionMaxAttempts = 8
+
+	// regulationTransactionRetryInterval is multiplied by the attempt number to derive the wait before trying the
+	// decision again, giving the concurrent decision which acquired the relevant locks time to finish.
+	regulationTransactionRetryInterval = 2 * time.Millisecond
+)
+
+// RegulationTransaction executes f as a single regulation decision. f runs inside a serializable transaction, and
+// either every write performed by f is committed or the transaction is rolled back discarding all of them.
+// Serialization failures (database/table lock contention, deadlocks, and serialization isolation failures) roll
+// the transaction back and cause the whole decision to be attempted again, while any other failure is returned
+// immediately without retries.
+func (p *SQLProvider) RegulationTransaction(ctx context.Context, f func(tx context.Context) error) (err error) {
+	for attempt := 0; attempt < regulationTransactionMaxAttempts; attempt++ {
+		if attempt != 0 {
+			timer := time.NewTimer(time.Duration(attempt) * regulationTransactionRetryInterval)
+
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		var tx context.Context
+
+		if tx, err = p.beginRegulationTX(ctx); err != nil {
+			if IsSerializationFailure(err) {
+				continue
+			}
+
+			return err
+		}
+
+		if err = f(tx); err != nil {
+			_ = p.Rollback(tx)
+
+			if IsSerializationFailure(err) {
+				continue
+			}
+
+			return err
+		}
+
+		if err = p.Commit(tx); err != nil {
+			if IsSerializationFailure(err) {
+				continue
+			}
+
+			return err
+		}
+
+		return nil
+	}
+
+	return err
+}
+
+// beginRegulationTX begins a serializable transaction used to converge a single regulation decision.
+func (p *SQLProvider) beginRegulationTX(ctx context.Context) (c context.Context, err error) {
+	var tx SQLXTx
+
+	if tx, err = p.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}); err != nil {
+		return nil, err
+	}
+
+	return context.WithValue(ctx, ctxKeyTransaction, tx), nil
+}
+
 // Close the underlying storage provider.
 func (p *SQLProvider) Close() (err error) {
 	return p.db.Close()

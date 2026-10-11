@@ -636,6 +636,20 @@ func (mr *MockStorageMockRecorder) LoadRegulationRecordsByUser(ctx, username, si
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LoadRegulationRecordsByUser", reflect.TypeOf((*MockStorage)(nil).LoadRegulationRecordsByUser), ctx, username, since, limit)
 }
 
+// RegulationTransaction mocks base method.
+func (m *MockStorage) RegulationTransaction(ctx context.Context, f func(context.Context) error) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RegulationTransaction", ctx, f)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RegulationTransaction indicates an expected call of RegulationTransaction.
+func (mr *MockStorageMockRecorder) RegulationTransaction(ctx, f any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RegulationTransaction", reflect.TypeOf((*MockStorage)(nil).RegulationTransaction), ctx, f)
+}
+
 // LoadTOTPConfiguration mocks base method.
 func (m *MockStorage) LoadTOTPConfiguration(ctx context.Context, username string) (*model.TOTPConfiguration, error) {
 	m.ctrl.T.Helper()

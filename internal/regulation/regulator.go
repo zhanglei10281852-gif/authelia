@@ -5,7 +5,9 @@
 package regulation
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"time"
 
@@ -30,6 +32,8 @@ func NewRegulator(config schema.Regulation, store storage.RegulatorProvider, clo
 // HandleAttempt records an authentication attempt and applies the relevant bans.
 func (r *Regulator) HandleAttempt(ctx Context, successful bool, ban *Ban, requestURI, requestMethod, authType string) {
 	if ban.Type() == BanTypeUnknown {
+		// Only the ban type is filled in: the attempt keeps whatever value was provided with the ban, which may be
+		// empty when the username could not be resolved.
 		ban.ban, _, _, _ = r.banCheckIP(ctx)
 	}
 
@@ -49,99 +53,78 @@ func (r *Regulator) HandleAttempt(ctx Context, successful bool, ban *Ban, reques
 		RequestMethod: requestMethod,
 	}
 
-	var err error
-	if err = r.store.AppendAuthenticationLog(ctx, attempt); err != nil {
-		ctx.GetLogger().WithFields(map[string]any{fieldUsername: username, "successful": successful}).WithError(err).Errorf("Failed to record %s authentication attempt", authType)
-	}
+	// We only need to perform the ban checks when; the attempt is unsuccessful, there is not an effective ban in
+	// place, regulation is enabled, and the authentication type is 1FA. When IP regulation is disabled and the
+	// username is empty there is also no subject to count or ban, so we can return after recording the attempt.
+	if successful || banned || (!r.ips && (!r.users || username == "")) || authType != AuthType1FA {
+		if err := r.store.AppendAuthenticationLog(ctx, attempt); err != nil {
+			ctx.GetLogger().WithFields(map[string]any{fieldUsername: username, "successful": successful}).WithError(err).Errorf("Failed to record %s authentication attempt", authType)
+		}
 
-	// We only need to perform the ban checks when; the attempt is unsuccessful, there is not an effective ban in place,
-	// regulation is enabled, and the authentication type is 1FA. Thus if this is not the case we can return here.
-	if successful || banned || (!r.ips && !r.users) || authType != AuthType1FA {
 		return
 	}
 
+	if err := r.handleAttemptPossibleBans(ctx, attempt, username); err != nil {
+		logDecisionError(ctx, username, err)
+	}
+}
+
+// handleAttemptPossibleBans records the failed attempt and derives the relevant user and/or IP ban as a single
+// decision: the attempt record and every ban derived from it are either all committed together, or the transaction
+// is rolled back discarding all of them. Failing to record the attempt, failing to load the records, or failing to
+// save any of the derived bans therefore never results in a ban based on incomplete records, and concurrent
+// decisions for the same subject can only produce one effective ban.
+func (r *Regulator) handleAttemptPossibleBans(ctx Context, attempt model.AuthenticationAttempt, username string) error {
+	ip := model.NewIP(ctx.RemoteIP())
 	since := r.clock.Now().Add(-r.config.FindTime)
 
-	r.handleAttemptPossibleBannedIP(ctx, since)
-	r.handleAttemptPossibleBannedUser(ctx, since, username)
-}
+	return r.store.RegulationTransaction(ctx, func(tx context.Context) error {
+		if err := r.store.AppendAuthenticationLog(tx, attempt); err != nil {
+			return newDecisionError("Failed to record "+attempt.Type+" authentication attempt", map[string]any{fieldUsername: username, "successful": attempt.Successful}, err)
+		}
 
-func (r *Regulator) handleAttemptPossibleBannedIP(ctx Context, since time.Time) {
-	if !r.ips {
-		return
-	}
+		if r.ips {
+			records, err := r.store.LoadRegulationRecordsByIP(tx, ip, since, r.config.MaxRetries)
+			if err != nil {
+				return newDecisionError("Failed to load regulation records", map[string]any{fieldRecordType: typeIP}, err)
+			}
 
-	var (
-		records []model.RegulationRecord
-		err     error
-	)
+			if banexp := r.expires(since, records); banexp != nil {
+				sqlban := &model.BannedIP{
+					Expires: sql.NullTime{Valid: true, Time: *banexp},
+					IP:      ip,
+					Source:  "regulation",
+					Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
+				}
 
-	ip := model.NewIP(ctx.RemoteIP())
+				if err = r.store.SaveBannedIP(tx, sqlban); err != nil {
+					return newDecisionError("Failed to save ban", map[string]any{fieldBanType: typeIP}, err)
+				}
+			}
+		}
 
-	log := ctx.GetLogger()
+		if r.users && username != "" {
+			records, err := r.store.LoadRegulationRecordsByUser(tx, username, since, r.config.MaxRetries)
+			if err != nil {
+				return newDecisionError("Failed to load regulation records", map[string]any{fieldRecordType: typeUser, fieldUsername: username}, err)
+			}
 
-	if records, err = r.store.LoadRegulationRecordsByIP(ctx, ip, since, r.config.MaxRetries); err != nil {
-		log.WithFields(map[string]any{fieldRecordType: typeIP}).WithError(err).Error("Failed to load regulation records")
+			if banexp := r.expires(since, records); banexp != nil {
+				sqlban := &model.BannedUser{
+					Expires:  sql.NullTime{Valid: true, Time: *banexp},
+					Username: username,
+					Source:   "regulation",
+					Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
+				}
 
-		return
-	}
+				if err = r.store.SaveBannedUser(tx, sqlban); err != nil {
+					return newDecisionError("Failed to save ban", map[string]any{fieldBanType: typeUser, fieldUsername: username}, err)
+				}
+			}
+		}
 
-	banexp := r.expires(since, records)
-
-	if banexp == nil {
-		return
-	}
-
-	sqlban := &model.BannedIP{
-		Expires: sql.NullTime{Valid: true, Time: *banexp},
-		IP:      ip,
-		Source:  "regulation",
-		Reason:  sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
-	}
-
-	if err = r.store.SaveBannedIP(ctx, sqlban); err != nil {
-		log.WithFields(map[string]any{fieldBanType: typeIP}).WithError(err).Error("Failed to save ban")
-
-		return
-	}
-}
-
-func (r *Regulator) handleAttemptPossibleBannedUser(ctx Context, since time.Time, username string) {
-	if !r.users || username == "" {
-		return
-	}
-
-	var (
-		records []model.RegulationRecord
-		err     error
-	)
-
-	log := ctx.GetLogger()
-
-	if records, err = r.store.LoadRegulationRecordsByUser(ctx, username, since, r.config.MaxRetries); err != nil {
-		log.WithFields(map[string]any{fieldRecordType: typeUser, fieldUsername: username}).WithError(err).Error("Failed to load regulation records")
-
-		return
-	}
-
-	banexp := r.expires(since, records)
-
-	if banexp == nil {
-		return
-	}
-
-	sqlban := &model.BannedUser{
-		Expires:  sql.NullTime{Valid: true, Time: *banexp},
-		Username: username,
-		Source:   "regulation",
-		Reason:   sql.NullString{Valid: true, String: "Exceeding Maximum Retries"},
-	}
-
-	if err = r.store.SaveBannedUser(ctx, sqlban); err != nil {
-		log.WithFields(map[string]any{fieldBanType: typeUser, fieldUsername: username}).WithError(err).Error("Failed to save ban")
-
-		return
-	}
+		return nil
+	})
 }
 
 func (r *Regulator) banCheckIP(ctx Context) (ban BanType, value string, expires *time.Time, err error) {
@@ -211,4 +194,36 @@ loop:
 	expires := failures[0].Time.Add(r.config.BanTime)
 
 	return &expires
+}
+
+// decisionError classifies a failure of a regulation decision so the failure can be logged with the relevant message
+// and fields, while still allowing the underlying database error to be inspected via errors.As/Is.
+type decisionError struct {
+	message string
+	fields  map[string]any
+	err     error
+}
+
+func newDecisionError(message string, fields map[string]any, err error) *decisionError {
+	return &decisionError{message: message, fields: fields, err: err}
+}
+
+func (e *decisionError) Error() string {
+	return e.err.Error()
+}
+
+func (e *decisionError) Unwrap() error {
+	return e.err
+}
+
+func logDecisionError(ctx Context, username string, err error) {
+	var decision *decisionError
+
+	if errors.As(err, &decision) {
+		ctx.GetLogger().WithFields(decision.fields).WithError(err).Error(decision.message)
+
+		return
+	}
+
+	ctx.GetLogger().WithField(fieldUsername, username).WithError(err).Error("Failed to apply regulation")
 }
